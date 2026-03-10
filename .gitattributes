@@ -1,0 +1,2 @@
+# Git LFS - 大容量Excelファイル
+ラインナップ表/*.xlsx filter=lfs diff=lfs merge=lfs -text

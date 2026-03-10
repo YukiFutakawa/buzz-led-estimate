@@ -1,0 +1,27 @@
+# 環境設定
+.env
+.env.*
+__pycache__/
+*.pyc
+
+# 出力（都度削除するため不要）
+output/
+
+# バックアップファイル（容量節約）
+*_backup_*.xlsx
+
+# 現調写真（大容量・案件固有）
+現調写真/
+
+# 正解データ・フィードバック（学習用・ローカルのみ）
+正しい見積り/
+feedback/
+
+# OS/IDE
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Streamlit
+.streamlit/secrets.toml

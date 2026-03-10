@@ -1,0 +1,163 @@
+# LED見積作成 - 器具種別→ラインナップシート対応ルール
+#
+# 現調データの電球種別(bulb_type)と照明種別(fixture_type)から
+# 検索するラインナップシートを特定するための設定
+
+# Step 1: 電球種別からワット形を決定
+bulb_type_to_watt_form:
+  FL10: "20形"
+  FL15: "20形"
+  FL20: "20形"
+  FL30: "40形"
+  FL40: "40形"
+  FLR40: "40形"
+  FHF32: "40形"
+  FHF16: "20形"
+  FCL20: "天井・壁面"
+  FCL30: "天井・壁面"
+  FCL32: "天井・壁面"
+  FCL40: "天井・壁面"
+  FDL: "ﾀﾞｳﾝﾗｲﾄ"
+  FHT: "ﾀﾞｳﾝﾗｲﾄ"
+  FPL: "ﾀﾞｳﾝﾗｲﾄ"
+  FML: "天井・壁面"
+  白熱: "天井・壁面"
+  LED: "LED球"
+
+# Step 2: 照明種別キーワード→ラインナップシート
+# 上から順にマッチし、最初にヒットしたシートを使用
+fixture_type_keywords:
+  # --- 専用カテゴリ（最優先） ---
+  - keyword: "EEスイッチ"
+    sheet: "EEスイッチ他"
+  - keyword: "スクエアライト"
+    sheet: "丸・四角(大)"    # ★Fix52: 埋込スクエアライト→丸・四角(大)シート
+    is_recessed: true
+  - keyword: "ダウンライト"
+    sheet: "ﾀﾞｳﾝﾗｲﾄ"
+    is_recessed: true
+  - keyword: "DL"
+    sheet: "ﾀﾞｳﾝﾗｲﾄ"
+    is_recessed: true
+  - keyword: "ポーチ"
+    sheet: "ﾎﾟｰﾁ・支柱"
+  - keyword: "支柱"
+    sheet: "ﾎﾟｰﾁ・支柱"
+  - keyword: "門柱"
+    sheet: "門柱灯"
+  - keyword: "庭園"
+    sheet: "外部・ﾊﾞｲﾊﾟｽ"    # ★Fix21: 庭園灯はTランプバイパス交換が主流
+  - keyword: "フットライト"
+    sheet: "ﾌｯﾄﾗｲﾄ"
+  - keyword: "足元灯"
+    sheet: "ﾌｯﾄﾗｲﾄ"
+  - keyword: "センサー付スポット"
+    sheet: "人感ｾﾝｻ"    # ★Fix37: センサー付スポットライトは人感センサーシートへ
+  - keyword: "スポット"
+    sheet: "ｽﾎﾟｯﾄﾗｲﾄ"
+  - keyword: "投光器"
+    sheet: "投光器・高天井"
+  - keyword: "高天井"
+    sheet: "投光器・高天井"
+  - keyword: "防犯灯"
+    sheet: "防犯灯"
+  - keyword: "ポール灯"
+    sheet: "外部・ﾊﾞｲﾊﾟｽ"    # ★改善: コーンランプ/Tランプは外部・バイパスシートにある
+  - keyword: "誘導灯"
+    sheet: "誘導灯 各社"
+  - keyword: "人感"
+    sheet: "人感ｾﾝｻ"
+  - keyword: "センサー"
+    sheet: "人感ｾﾝｻ"
+  - keyword: "表札"
+    sheet: "表札・ﾎﾟｰﾁ（250lm以下）"
+  - keyword: "看板"
+    sheet: "表札・ﾎﾟｰﾁ（250lm以下）"    # ★Fix45: 看板灯→表札・ポーチ系（下方配光タイプ）
+  - keyword: "アクセント"
+    sheet: "ｱｸｾﾝﾄﾗｲﾄ"
+  - keyword: "筒型"
+    sheet: "筒型ブラ"
+  # --- 蛍光灯形状（逆富士/トラフ → ベースライト系） ---
+  - keyword: "逆富士"
+    sheet: "20形蛍光灯"    # サイズから20形/40形を自動判定（_determine_sheet内で上書き）
+  - keyword: "トラフ"
+    sheet: "20形蛍光灯"
+  # --- ★Fix21: 玄関灯 → ポーチ・支柱（玄関のポーチライト/壁面灯） ---
+  - keyword: "玄関灯"
+    sheet: "ﾎﾟｰﾁ・支柱"
+  # --- 壁面ブラケット → ポーチ・支柱（長方形壁面はポーチ系） ---
+  # ※ led_matcher.py の _determine_sheet() で寸法ベースの分岐を実装
+  - keyword: "壁面ブラケット"
+    sheet: "ﾎﾟｰﾁ・支柱"
+  # --- 一般ブラケット ---
+  - keyword: "ブラケット"
+    sheet_by_waterproof:
+      true: "屋外ﾌﾞﾗｹｯﾄ"
+      false: "天井・壁面"
+  - keyword: "屋外"
+    sheet: "屋外ﾌﾞﾗｹｯﾄ"
+  # --- 階段灯 → その他非常灯（非常用階段灯商品がある） ---
+  - keyword: "階段灯"
+    sheet: "その他非常灯"   # ★改善: 非常用階段灯20形はその他非常灯シートにある
+  - keyword: "シーリング"
+    sheet: "天井・壁面"
+  - keyword: "天井"
+    sheet: "天井・壁面"
+  - keyword: "壁付"
+    sheet: "天井・壁面"
+  - keyword: "バイパス"
+    sheet: "バイパスコーウェル"
+
+# Step 3: 非常灯キーワード検出
+emergency_keywords:
+  - "非常灯"
+  - "非常用"
+  - "非常"
+
+# 非常灯のワット形→ラインナップシート
+emergency_sheets:
+  "20形": "非常灯20形"
+  "40形": "非常灯40形"
+  default: "その他非常灯"
+
+# Step 4: 色温度マッピング
+color_mapping:
+  白: "昼白色"
+  昼白色: "昼白色"
+  昼白: "昼白色"
+  N: "昼白色"
+  黄: "電球色"
+  電球色: "電球色"
+  電球: "電球色"
+  L: "電球色"
+  温白色: "温白色"
+  WW: "温白色"
+
+# Step 5: 工事単価デフォルト値
+construction_prices:
+  器具交換: 3000
+  埋込器具交換: 5000          # 2026/02/26〜: 蛍光灯埋込タイプは5000円（全ネジボルト作業等で時間1.5〜2倍）
+  ランプ交換: 1500
+  バイパス工事: 5000
+  waterproof_addon: 500
+  emergency_addon: 1000
+  high_location_addon: 2000
+
+# Step 6: 設置場所からの防水自動判定キーワード
+waterproof_location_keywords:
+  - "脱衣"
+  - "浴室"
+  - "洗面"
+  - "屋外"
+  - "外部"
+  - "バルコニー"
+  - "ベランダ"
+  - "自転車置場"
+  - "駐輪場"
+  - "駐車場"
+
+# Step 7: 非常灯メーカー優先ルール
+# ★改善: 正解データ分析より三菱がコンパクト+安価で多数採用
+emergency_manufacturer_preference:
+  preferred: "三菱"
+  bonus_score: 2           # 三菱に追加スコア
