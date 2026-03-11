@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import logging
+import posixpath
 import shutil
+import xml.etree.ElementTree as ET
+import zipfile
 from pathlib import Path
 from typing import Optional
 
@@ -81,6 +84,151 @@ def _safe_write(ws, row: int, col: int, value) -> None:
     cell.value = value
 
 
+def _save_sheet_formatting(ws) -> dict:
+    """openpyxlがsave時に壊す可能性のあるシート書式を保存
+
+    対象: データバリデーション（プルダウン）、条件付き書式、オートフィルタ
+    """
+    return {
+        "data_validations": list(ws.data_validations.dataValidation),
+        "conditional_formatting": list(ws.conditional_formatting),
+        "auto_filter_ref": ws.auto_filter.ref if ws.auto_filter.ref else None,
+    }
+
+
+def _restore_sheet_formatting(ws, saved: dict) -> None:
+    """保存した書式設定を復元"""
+    # データバリデーション（プルダウン等）
+    ws.data_validations.dataValidation = saved["data_validations"]
+
+    # 条件付き書式
+    ws.conditional_formatting._cf_rules = []
+    for cf in saved["conditional_formatting"]:
+        ws.conditional_formatting.append(cf)
+
+    # オートフィルタ
+    if saved["auto_filter_ref"]:
+        ws.auto_filter.ref = saved["auto_filter_ref"]
+
+
+def _restore_unmodified_sheets(
+    template_path: Path, output_path: Path,
+    modified_sheet_names: set[str],
+) -> None:
+    """openpyxl保存後、未変更シートのXMLをテンプレートから復元
+
+    openpyxlはload→save時にすべてのシートを再シリアライズするため、
+    書き込み対象外のシート（①表紙～⑧見積書等）のレイアウト・書式・
+    チャート等が壊れることがある。この関数はZIPレベルで元のXMLを復元する。
+    """
+    NS_MAIN = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+    NS_R = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+    NS_PKG = "http://schemas.openxmlformats.org/package/2006/relationships"
+
+    def _get_sheet_xml_map(zf: zipfile.ZipFile) -> dict[str, str]:
+        """シート名 → ZIP内XMLパスのマッピングを返す"""
+        wb_xml = ET.fromstring(zf.read("xl/workbook.xml"))
+
+        # sheet name → rId
+        sheet_rids: dict[str, str] = {}
+        for elem in wb_xml.iter(f"{{{NS_MAIN}}}sheet"):
+            name = elem.get("name")
+            rid = elem.get(f"{{{NS_R}}}id")
+            if name and rid:
+                sheet_rids[name] = rid
+
+        # rId → target path
+        rels_xml = ET.fromstring(
+            zf.read("xl/_rels/workbook.xml.rels")
+        )
+        rid_targets: dict[str, str] = {}
+        for elem in rels_xml.iter(f"{{{NS_PKG}}}Relationship"):
+            rid_targets[elem.get("Id")] = elem.get("Target")
+        # Fallback: namespace なしの Relationship 要素
+        for elem in rels_xml.iter("Relationship"):
+            rid = elem.get("Id")
+            if rid and rid not in rid_targets:
+                rid_targets[rid] = elem.get("Target")
+
+        result: dict[str, str] = {}
+        for name, rid in sheet_rids.items():
+            target = rid_targets.get(rid)
+            if target:
+                if not target.startswith("/"):
+                    target = f"xl/{target}"
+                else:
+                    target = target.lstrip("/")
+                result[name] = target
+        return result
+
+    def _get_associated_files(
+        zf: zipfile.ZipFile, sheet_xml_path: str,
+    ) -> set[str]:
+        """シートXMLに関連するファイル群（rels, drawings等）を返す"""
+        files = {sheet_xml_path}
+
+        # rels ファイル
+        dir_part, file_part = posixpath.split(sheet_xml_path)
+        rels_path = posixpath.join(dir_part, "_rels", file_part + ".rels")
+        if rels_path not in zf.namelist():
+            return files
+        files.add(rels_path)
+
+        # rels内の参照先（drawings, charts等）
+        rels_xml = ET.fromstring(zf.read(rels_path))
+        for elem in rels_xml.iter(f"{{{NS_PKG}}}Relationship"):
+            target = elem.get("Target")
+            if target and not target.startswith("http"):
+                resolved = posixpath.normpath(
+                    posixpath.join(dir_part, target)
+                )
+                if resolved in zf.namelist():
+                    files.add(resolved)
+        for elem in rels_xml.iter("Relationship"):
+            target = elem.get("Target")
+            if target and not target.startswith("http"):
+                resolved = posixpath.normpath(
+                    posixpath.join(dir_part, target)
+                )
+                if resolved in zf.namelist():
+                    files.add(resolved)
+
+        return files
+
+    with zipfile.ZipFile(str(template_path), "r") as tzf:
+        sheet_map = _get_sheet_xml_map(tzf)
+
+        # 復元対象ファイルを収集
+        files_to_restore: dict[str, bytes] = {}
+        for sheet_name, xml_path in sheet_map.items():
+            if sheet_name in modified_sheet_names:
+                continue
+            for fpath in _get_associated_files(tzf, xml_path):
+                files_to_restore[fpath] = tzf.read(fpath)
+
+        if not files_to_restore:
+            return
+
+        logger.info(
+            f"テンプレート復元: {len(files_to_restore)}ファイル "
+            f"({len(sheet_map) - len(modified_sheet_names)}シート分)"
+        )
+
+    # 出力ZIPを再構築
+    temp_path = output_path.with_suffix(".tmp.xlsx")
+    with zipfile.ZipFile(str(output_path), "r") as ozf:
+        with zipfile.ZipFile(
+            str(temp_path), "w", zipfile.ZIP_DEFLATED,
+        ) as nzf:
+            for item in ozf.infolist():
+                if item.filename in files_to_restore:
+                    nzf.writestr(item, files_to_restore[item.filename])
+                else:
+                    nzf.writestr(item, ozf.read(item.filename))
+
+    temp_path.replace(output_path)
+
+
 class ExcelWriter:
     """見積テンプレートへの書き込みエンジン"""
 
@@ -117,13 +265,30 @@ class ExcelWriter:
 
         # ☆入力シートへの書き込み
         ws_input = wb[sheet_names["input"]]
+
+        # 書式設定を保存（openpyxlがsave時に壊す対策）
+        saved_input_fmt = _save_sheet_formatting(ws_input)
+
         self._write_property_info(ws_input, job.survey.property_info)
         self._write_fixture_rows(ws_input, job.matches)
         self._write_excluded_rows(ws_input, job.survey.excluded_fixtures)
 
+        # 書式設定を復元（プルダウン・条件付き書式・オートフィルタ）
+        _restore_sheet_formatting(ws_input, saved_input_fmt)
+
         # 選定シートへの書き込み
         ws_selection = wb[sheet_names["selection"]]
+        saved_selection_fmt = _save_sheet_formatting(ws_selection)
+
         self._write_selection_sheet(ws_selection, job.matches)
+
+        _restore_sheet_formatting(ws_selection, saved_selection_fmt)
+
+        # 書き込み対象シート名を記録（ZIP復元時に除外するため）
+        modified_sheets = {
+            sheet_names["input"],
+            sheet_names["selection"],
+        }
 
         # 写真挿入（画像インデックスがある場合のみ）
         if self.image_index:
@@ -134,20 +299,31 @@ class ExcelWriter:
             breakdown_name = sheet_names.get("breakdown")
             if breakdown_name and breakdown_name in wb.sheetnames:
                 ws_breakdown = wb[breakdown_name]
+                saved_bd_fmt = _save_sheet_formatting(ws_breakdown)
                 self._write_breakdown_photos(
                     ws_breakdown, job.matches, job.survey,
                 )
+                _restore_sheet_formatting(ws_breakdown, saved_bd_fmt)
+                modified_sheets.add(breakdown_name)
 
             # ⑪除外シートに除外器具写真を挿入
             exclusion_name = sheet_names.get("exclusion")
             if exclusion_name and exclusion_name in wb.sheetnames:
                 ws_exclusion = wb[exclusion_name]
+                saved_ex_fmt = _save_sheet_formatting(ws_exclusion)
                 self._write_exclusion_photos(
                     ws_exclusion, job.survey.excluded_fixtures,
                 )
+                _restore_sheet_formatting(ws_exclusion, saved_ex_fmt)
 
         wb.save(job.output_path)
         wb.close()
+
+        # 未変更シート（①表紙～⑧見積書等）をテンプレートから復元
+        # openpyxlのload→saveで壊れたXMLを元に戻す
+        _restore_unmodified_sheets(
+            template_path, job.output_path, modified_sheets,
+        )
 
         logger.info(f"見積ファイル出力完了: {job.output_path}")
         return job.output_path
