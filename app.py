@@ -464,12 +464,21 @@ def tab_feedback():
 
     st.divider()
 
-    # --- コメント入力 ---
-    comment = st.text_area(
-        "コメント（任意）",
-        height=100,
-        placeholder="例: 3階の逆富士がFHF32\u2192FHF16に修正。非常灯の数量もずれていた。",
-        key="fb_comment",
+    # --- コメント入力（2カテゴリ） ---
+    st.markdown("**コメント（任意）**")
+
+    comment_reading = st.text_area(
+        "① 現調情報の読み取りについて",
+        height=80,
+        placeholder="例: 3階の逆富士が40wではなく20wだった。非常灯の数量が1台多くカウントされていた。",
+        key="fb_comment_reading",
+    )
+
+    comment_selection = st.text_area(
+        "② LED選定について",
+        height=80,
+        placeholder="例: FHF32はiDシリーズではなくmyシリーズが適切。非常灯は一体型を選定すべき。",
+        key="fb_comment_selection",
     )
 
     # --- バリデーション ---
@@ -564,7 +573,10 @@ def tab_feedback():
                     "correct_file": report.correct_file,
                     "timestamp": datetime.now().isoformat(),
                     "property_name": report.property_name,
-                    "comment": comment,
+                    "comment": {
+                        "reading": comment_reading,
+                        "selection": comment_selection,
+                    },
                     "summary": {
                         "total_diffs": report.total_diffs,
                         "fixture_match_rate": round(report.fixture_match_rate, 3),
