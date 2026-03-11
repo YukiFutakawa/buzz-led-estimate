@@ -98,10 +98,12 @@ class LEDMatcher:
         self,
         lineup_index: LineupIndex,
         config: Optional[CategoryConfig] = None,
+        feedback_rules: Optional[list[dict]] = None,
     ):
         self.index = lineup_index
         self.config = config or CategoryConfig()
         self._size_cache: dict[str, FixtureDimensions] = {}
+        self._feedback_rules = feedback_rules or []
 
     def match_all(
         self, fixtures: list[ExistingFixture],
@@ -142,6 +144,11 @@ class LEDMatcher:
 
         # Step 1: 器具分類
         classification = self._classify_fixture(fixture)
+
+        # Step 1.5: フィードバックルールによる上書きチェック
+        override = self._check_feedback_override(fixture, classification)
+        if override is not None:
+            return override
 
         # Step 2: 候補商品検索
         candidates = self._search_candidates(classification, fixture)
@@ -662,6 +669,73 @@ class LEDMatcher:
         return "天井・壁面"
 
     # ===== 候補検索 =====
+
+    # ===== フィードバックルール適用 =====
+
+    def _check_feedback_override(
+        self,
+        fixture: ExistingFixture,
+        classification: FixtureClassification,
+    ) -> Optional[MatchResult]:
+        """フィードバック学習ルールによるLED選定の上書き
+
+        過去のフィードバックで修正実績が2回以上あるルールに合致する場合、
+        通常の選定ロジックをスキップしてルール指定の製品を返す。
+        """
+        if not self._feedback_rules:
+            return None
+
+        ft_norm = _normalize(fixture.fixture_type or "").lower()
+        if not ft_norm:
+            return None
+
+        for rule in self._feedback_rules:
+            count = rule.get("count", 0)
+            if count < 2:
+                continue
+
+            rule_ft = _normalize(rule.get("fixture_type", "")).lower()
+            if not rule_ft:
+                continue
+
+            # 器具種別の照合（部分一致）
+            if rule_ft not in ft_norm and ft_norm not in rule_ft:
+                continue
+
+            correct_name = rule.get("correct_selection", "")
+            if not correct_name:
+                continue
+
+            # ラインナップから指定製品を検索
+            candidates = self._search_candidates(classification, fixture)
+            correct_norm = _normalize(correct_name).lower()
+
+            matched_product = None
+            for p in candidates:
+                if p.name and _normalize(p.name).lower() == correct_norm:
+                    matched_product = p
+                    break
+
+            if matched_product:
+                construction_price = self._estimate_construction_price(
+                    fixture, matched_product, classification,
+                )
+                logger.info(
+                    f"フィードバックルール適用: {fixture.fixture_type} → "
+                    f"{matched_product.name} (修正実績: {count}回)"
+                )
+                return MatchResult(
+                    fixture=fixture,
+                    led_product=matched_product,
+                    category_key=matched_product.name or "",
+                    confidence=0.95,
+                    match_notes=(
+                        f"フィードバックルール適用 (修正実績: {count}回)"
+                    ),
+                    construction_unit_price=construction_price,
+                )
+
+        return None
 
     def _search_candidates(
         self, cls: FixtureClassification,

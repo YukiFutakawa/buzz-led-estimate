@@ -13,6 +13,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 from pathlib import Path
 from typing import Optional
@@ -339,7 +340,8 @@ def run_from_survey_data(
     img_idx = LineupImageIndex()
     img_idx.load_all(lineup_dir)
 
-    matcher = LEDMatcher(lineup_idx)
+    feedback_rules = _load_feedback_rules()
+    matcher = LEDMatcher(lineup_idx, feedback_rules=feedback_rules)
     matches = matcher.match_all(survey.fixtures)
 
     # 除外器具のMatchResultも生成
@@ -401,6 +403,30 @@ def run_from_survey_data(
 
 # 後方互換エイリアス
 _run_from_step5 = run_from_survey_data
+
+
+def _load_feedback_rules() -> list[dict]:
+    """フィードバック学習ルールをファイルから読み込み
+
+    feedback/led_selection_rules.json が存在すれば読み込む。
+    ファイルがなければ空リスト（従来動作にフォールバック）。
+    """
+    rules_path = Path(__file__).parent.parent / "feedback" / "led_selection_rules.json"
+    if not rules_path.exists():
+        return []
+
+    try:
+        rules = json.loads(rules_path.read_text(encoding="utf-8"))
+        if rules:
+            applicable = [r for r in rules if r.get("count", 0) >= 2]
+            logger.info(
+                f"フィードバックルール読み込み: {len(rules)}件 "
+                f"(適用対象: {len(applicable)}件)"
+            )
+        return rules
+    except Exception as e:
+        logger.warning(f"フィードバックルール読み込みエラー: {e}")
+        return []
 
 
 def _auto_feedback(ai_output_path: Path) -> None:

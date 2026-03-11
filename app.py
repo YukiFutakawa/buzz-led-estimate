@@ -628,6 +628,42 @@ def tab_feedback():
                 prop_name = report.property_name or "unknown"
                 filename = f"feedback_{prop_name}_{timestamp_str}.json"
 
+                # --- フィードバック送信（Google Sheets） ---
+                _sheets_available = False
+                try:
+                    from feedback_store import FeedbackStore
+                    _store = FeedbackStore.from_streamlit_secrets()
+                    _sheets_available = True
+                except Exception:
+                    pass
+
+                if _sheets_available:
+                    if st.button("フィードバック送信",
+                                 type="primary", use_container_width=True):
+                        try:
+                            fid = _store.submit_feedback(
+                                report_dict=report_dict,
+                                comment_reading=comment_reading,
+                                comment_selection=comment_selection,
+                            )
+                            st.success(f"フィードバック送信完了 (ID: {fid})")
+                        except Exception as e:
+                            st.error(f"送信エラー: {e}")
+
+                    # 累計統計
+                    try:
+                        stats = _store.get_feedback_stats()
+                        if stats.get("total_feedback"):
+                            st.caption(
+                                f"累計フィードバック: {stats['total_feedback']}件 / "
+                                f"LED選定平均一致率: {stats['avg_led_match_rate']:.0%}"
+                            )
+                    except Exception:
+                        pass
+
+                    st.divider()
+
+                # --- JSON ダウンロード（バックアップ） ---
                 st.download_button(
                     label="フィードバックJSONダウンロード",
                     data=feedback_json,
@@ -636,10 +672,13 @@ def tab_feedback():
                     use_container_width=True,
                 )
 
-                st.caption(
-                    "ダウンロードしたJSONを保管しておくと、"
-                    "蓄積データからAIロジックの改善に活用できます。"
-                )
+                if _sheets_available:
+                    st.caption("送信済みデータは日次で自動的にシステム改善に反映されます。")
+                else:
+                    st.caption(
+                        "ダウンロードしたJSONを保管しておくと、"
+                        "蓄積データからAIロジックの改善に活用できます。"
+                    )
 
             except Exception as e:
                 st.error(f"比較エラー: {e}")
