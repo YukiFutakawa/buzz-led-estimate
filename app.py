@@ -58,6 +58,28 @@ PDF_EXTENSIONS = {".pdf"}
 
 
 # ============================================================
+# セッション状態の初期化
+# ============================================================
+
+def init_session():
+    """AI生成Excel履歴をセッションに保持"""
+    if "ai_excel_history" not in st.session_state:
+        st.session_state.ai_excel_history = []  # [{name, bytes, timestamp, property_name}, ...]
+
+
+def save_ai_excel_to_session(excel_bytes: bytes, filename: str, property_name: str):
+    """AI生成Excelをセッション履歴に保存（最新10件）"""
+    st.session_state.ai_excel_history.insert(0, {
+        "name": filename,
+        "bytes": excel_bytes,
+        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "property_name": property_name,
+    })
+    # 最新10件のみ保持
+    st.session_state.ai_excel_history = st.session_state.ai_excel_history[:10]
+
+
+# ============================================================
 # ユーティリティ関数
 # ============================================================
 
@@ -364,12 +386,17 @@ def tab_estimate():
                 with open(result_path, "rb") as f:
                     excel_bytes = f.read()
 
+                # セッションに自動保存
+                save_ai_excel_to_session(excel_bytes, result_path.name, property_name)
+
                 st.download_button(
                     label=f"Excelダウンロード ({result_path.name})",
                     data=excel_bytes, file_name=result_path.name,
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     type="primary", use_container_width=True,
                 )
+
+                st.caption("この結果はフィードバックタブで自動的に使用できます。")
 
             except Exception as e:
                 st.error(f"エラー: {e}")
@@ -385,28 +412,55 @@ def tab_feedback():
     """フィードバックタブ — AI出力 vs 修正済みExcelを比較"""
 
     st.markdown(
-        "AI生成Excelと修正済みExcelをアップロードすると、"
-        "セルレベルで自動比較し差分レポートを作成します。"
+        "修正済みExcelをアップロードすると、"
+        "AI生成結果とセルレベルで自動比較し差分レポートを作成します。"
     )
 
     st.divider()
 
-    # --- ファイルアップロード ---
-    col1, col2 = st.columns(2)
-    with col1:
+    # --- AI生成Excel（システム保持） ---
+    history = st.session_state.get("ai_excel_history", [])
+
+    ai_excel_bytes = None
+    ai_excel_name = None
+
+    if history:
+        st.markdown("**AI生成Excel（自動保持）**")
+        # 選択肢を作成
+        options = [
+            f"{h['property_name']} - {h['name']}（{h['timestamp']}）"
+            for h in history
+        ]
+        selected_idx = st.selectbox(
+            "比較対象のAI生成結果を選択",
+            range(len(options)),
+            format_func=lambda i: options[i],
+            key="fb_ai_select",
+        )
+        ai_excel_bytes = history[selected_idx]["bytes"]
+        ai_excel_name = history[selected_idx]["name"]
+        st.caption(f"\u2705 {ai_excel_name} を使用")
+    else:
         st.markdown("**AI生成Excel（元）**")
-        ai_file = st.file_uploader(
-            "AI出力ファイル",
+        st.info("まだ見積を作成していません。見積作成タブで作成するか、手動でアップロードしてください。")
+        ai_file_manual = st.file_uploader(
+            "AI出力ファイル（手動アップロード）",
             type=["xlsx"],
-            key="fb_ai_file",
+            key="fb_ai_file_manual",
         )
-    with col2:
-        st.markdown("**修正済みExcel（正）**")
-        correct_file = st.file_uploader(
-            "人間が修正したファイル",
-            type=["xlsx"],
-            key="fb_correct_file",
-        )
+        if ai_file_manual:
+            ai_excel_bytes = ai_file_manual.getbuffer()
+            ai_excel_name = ai_file_manual.name
+
+    st.divider()
+
+    # --- 修正済みExcel ---
+    st.markdown("**修正済みExcel（正）**")
+    correct_file = st.file_uploader(
+        "人間が修正したファイル",
+        type=["xlsx"],
+        key="fb_correct_file",
+    )
 
     st.divider()
 
@@ -414,14 +468,17 @@ def tab_feedback():
     comment = st.text_area(
         "コメント（任意）",
         height=100,
-        placeholder="例: 3階の逆富士がFHF32→FHF16に修正。非常灯の数量もずれていた。",
+        placeholder="例: 3階の逆富士がFHF32\u2192FHF16に修正。非常灯の数量もずれていた。",
         key="fb_comment",
     )
 
     # --- バリデーション ---
-    can_compare = bool(ai_file and correct_file)
+    can_compare = bool(ai_excel_bytes and correct_file)
     if not can_compare:
-        st.info("AI生成Excelと修正済みExcelの両方をアップロードしてください")
+        if ai_excel_bytes and not correct_file:
+            st.info("修正済みExcelをアップロードしてください")
+        elif not ai_excel_bytes:
+            st.info("AI生成Excelがありません。見積作成タブで作成してください")
 
     # --- 比較実行 ---
     if st.button("比較実行", type="primary", disabled=not can_compare, use_container_width=True):
@@ -429,8 +486,8 @@ def tab_feedback():
             tmpdir = Path(tmpdir)
 
             # ファイル保存
-            ai_path = tmpdir / ai_file.name
-            ai_path.write_bytes(ai_file.getbuffer())
+            ai_path = tmpdir / (ai_excel_name or "ai_output.xlsx")
+            ai_path.write_bytes(ai_excel_bytes)
             correct_path = tmpdir / correct_file.name
             correct_path.write_bytes(correct_file.getbuffer())
 
@@ -502,7 +559,6 @@ def tab_feedback():
                 st.divider()
 
                 # --- フィードバックJSON生成・ダウンロード ---
-                # コメントを含めたJSONを生成
                 report_dict = {
                     "ai_file": report.ai_file,
                     "correct_file": report.correct_file,
@@ -561,7 +617,7 @@ def tab_feedback():
                 filename = f"feedback_{prop_name}_{timestamp_str}.json"
 
                 st.download_button(
-                    label=f"フィードバックJSONダウンロード",
+                    label="フィードバックJSONダウンロード",
                     data=feedback_json,
                     file_name=filename,
                     mime="application/json",
@@ -585,6 +641,7 @@ def tab_feedback():
 
 def main():
     st.set_page_config(page_title="LED見積作成", page_icon="\U0001f4a1", layout="centered")
+    init_session()
     st.title("LED見積シミュレーション作成")
 
     tab1, tab2 = st.tabs(["\U0001f4cb 見積作成", "\U0001f4dd フィードバック"])
