@@ -240,6 +240,95 @@ def _restore_unmodified_sheets(
     temp_path.replace(output_path)
 
 
+def _restore_sheet_extensions(
+    template_path: Path, output_path: Path,
+    modified_sheet_names: set[str],
+) -> None:
+    """変更シートのExtension要素(x14:dataValidations等)をテンプレートから復元
+
+    openpyxlはExcel 2010+の拡張データ入力規則(<extLst>内の
+    <x14:dataValidations>)に対応しておらず、load→save時に削除する。
+    この関数はテンプレートの<extLst>を変更シートのXMLに再注入する。
+    """
+    NS_MAIN = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+    NS_R = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+    NS_PKG = "http://schemas.openxmlformats.org/package/2006/relationships"
+
+    def _get_sheet_xml_map(zf: zipfile.ZipFile) -> dict[str, str]:
+        wb_xml = ET.fromstring(zf.read("xl/workbook.xml"))
+        sheet_rids: dict[str, str] = {}
+        for elem in wb_xml.iter(f"{{{NS_MAIN}}}sheet"):
+            name = elem.get("name")
+            rid = elem.get(f"{{{NS_R}}}id")
+            if name and rid:
+                sheet_rids[name] = rid
+        rels_xml = ET.fromstring(zf.read("xl/_rels/workbook.xml.rels"))
+        rid_targets: dict[str, str] = {}
+        for tag in (f"{{{NS_PKG}}}Relationship", "Relationship"):
+            for elem in rels_xml.iter(tag):
+                rid = elem.get("Id")
+                if rid and rid not in rid_targets:
+                    rid_targets[rid] = elem.get("Target")
+        result: dict[str, str] = {}
+        for name, rid in sheet_rids.items():
+            target = rid_targets.get(rid)
+            if target:
+                if not target.startswith("/"):
+                    target = f"xl/{target}"
+                else:
+                    target = target.lstrip("/")
+                result[name] = target
+        return result
+
+    with zipfile.ZipFile(str(template_path), "r") as tzf:
+        tpl_map = _get_sheet_xml_map(tzf)
+
+        # テンプレートから変更シートの<extLst>を抽出
+        ext_data: dict[str, str] = {}  # xml_path → extLst raw XML
+        for sheet_name in modified_sheet_names:
+            xml_path = tpl_map.get(sheet_name)
+            if not xml_path:
+                continue
+            raw = tzf.read(xml_path).decode("utf-8")
+            # <extLst> ... </extLst> を抽出
+            start = raw.find("<extLst")
+            end = raw.find("</extLst>")
+            if start >= 0 and end >= 0:
+                ext_xml = raw[start:end + len("</extLst>")]
+                ext_data[xml_path] = ext_xml
+                logger.info(
+                    f"拡張要素復元対象: {sheet_name} ({len(ext_xml)}文字)"
+                )
+
+    if not ext_data:
+        return
+
+    # 出力ファイルに<extLst>を再注入
+    temp_path = output_path.with_suffix(".tmp2.xlsx")
+    with zipfile.ZipFile(str(output_path), "r") as ozf:
+        with zipfile.ZipFile(
+            str(temp_path), "w", zipfile.ZIP_DEFLATED,
+        ) as nzf:
+            for item in ozf.infolist():
+                data = ozf.read(item.filename)
+                if item.filename in ext_data:
+                    text = data.decode("utf-8")
+                    ext_xml = ext_data[item.filename]
+                    # </worksheet> の直前に <extLst> を挿入
+                    close_tag = "</worksheet>"
+                    if close_tag in text and "<extLst" not in text:
+                        text = text.replace(
+                            close_tag, ext_xml + close_tag,
+                        )
+                        data = text.encode("utf-8")
+                        logger.info(
+                            f"拡張要素復元完了: {item.filename}"
+                        )
+                nzf.writestr(item, data)
+
+    temp_path.replace(output_path)
+
+
 class ExcelWriter:
     """見積テンプレートへの書き込みエンジン"""
 
@@ -336,6 +425,12 @@ class ExcelWriter:
             template_path, job.output_path, modified_sheets,
         )
 
+        # 変更シートの拡張要素（x14:dataValidations等）を復元
+        # openpyxlが非対応として削除するプルダウン等を再注入
+        _restore_sheet_extensions(
+            template_path, job.output_path, modified_sheets,
+        )
+
         logger.info(f"見積ファイル出力完了: {job.output_path}")
         return job.output_path
 
@@ -401,9 +496,8 @@ class ExcelWriter:
             if fixture.adjusted_power_w > 0:
                 _safe_write(ws, row, _col_to_idx("K"), fixture.adjusted_power_w)
 
-            # L列: 電球数（合計）
-            if fixture.quantities.total > 0:
-                _safe_write(ws, row, _col_to_idx("L"), fixture.quantities.total)
+            # L列: 電球数（合計）→ テンプレートに =SUM(M:V) 数式あり
+            # M-V列に各階数量を書き込めば自動計算されるため、L列には書き込まない
 
             # M-V列: 各階数量（1F〜10F）
             floor_start_col = _col_to_idx("M")  # M=13
