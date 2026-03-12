@@ -228,13 +228,9 @@ def _restore_unmodified_sheets(
                                     tzf.read(resolved)
                                 )
 
-        # openpyxlが削除するワークブック共通ファイルも復元
-        for common_file in (
-            "xl/sharedStrings.xml",
-            "xl/calcChain.xml",
-        ):
-            if common_file in tzf.namelist():
-                files_to_restore[common_file] = tzf.read(common_file)
+        # ※ sharedStrings.xml / calcChain.xml は復元しない
+        # openpyxlがセル内容を変更するため、テンプレートのものは不整合になる
+        # Excelが開く時に自動再生成するので問題ない
 
         # customXmlファイルを復元
         for fname in tzf.namelist():
