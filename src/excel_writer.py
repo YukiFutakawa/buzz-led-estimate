@@ -194,13 +194,52 @@ def _restore_unmodified_sheets(
     with zipfile.ZipFile(str(template_path), "r") as tzf:
         sheet_map = _get_sheet_xml_map(tzf)
 
-        # 復元対象ファイルを収集
+        # 復元対象ファイルを収集（未変更シートの関連ファイル）
         files_to_restore: dict[str, bytes] = {}
         for sheet_name, xml_path in sheet_map.items():
             if sheet_name in modified_sheet_names:
                 continue
             for fpath in _get_associated_files(tzf, xml_path):
                 files_to_restore[fpath] = tzf.read(fpath)
+
+        # 変更シートのrels・printerSettings等もテンプレートから復元
+        # （openpyxlがシートXMLは作るが、rels/printerSettingsを落とす）
+        for sheet_name in modified_sheet_names:
+            xml_path = sheet_map.get(sheet_name)
+            if not xml_path:
+                continue
+            dir_part, file_part = posixpath.split(xml_path)
+            rels_path = posixpath.join(
+                dir_part, "_rels", file_part + ".rels",
+            )
+            if rels_path in tzf.namelist():
+                files_to_restore[rels_path] = tzf.read(rels_path)
+                # rels内の参照先（printerSettings等）も復元
+                rels_xml = ET.fromstring(tzf.read(rels_path))
+                for tag in (f"{{{NS_PKG}}}Relationship", "Relationship"):
+                    for elem in rels_xml.iter(tag):
+                        target = elem.get("Target")
+                        if target and not target.startswith("http"):
+                            resolved = posixpath.normpath(
+                                posixpath.join(dir_part, target)
+                            )
+                            if resolved in tzf.namelist():
+                                files_to_restore[resolved] = (
+                                    tzf.read(resolved)
+                                )
+
+        # openpyxlが削除するワークブック共通ファイルも復元
+        for common_file in (
+            "xl/sharedStrings.xml",
+            "xl/calcChain.xml",
+        ):
+            if common_file in tzf.namelist():
+                files_to_restore[common_file] = tzf.read(common_file)
+
+        # customXmlファイルを復元
+        for fname in tzf.namelist():
+            if fname.startswith("customXml/"):
+                files_to_restore[fname] = tzf.read(fname)
 
         if not files_to_restore:
             return
@@ -213,6 +252,7 @@ def _restore_unmodified_sheets(
     # 出力ZIPを再構築
     temp_path = output_path.with_suffix(".tmp.xlsx")
     with zipfile.ZipFile(str(output_path), "r") as ozf:
+        out_names = set(ozf.namelist())
         with zipfile.ZipFile(
             str(temp_path), "w", zipfile.ZIP_DEFLATED,
         ) as nzf:
@@ -225,7 +265,6 @@ def _restore_unmodified_sheets(
                 written.add(item.filename)
 
             # テンプレートにのみ存在するファイルを追加
-            # （openpyxlが削除した drawing rels, media等）
             for fname, data in files_to_restore.items():
                 if fname not in written:
                     nzf.writestr(fname, data)
