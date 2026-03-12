@@ -274,30 +274,48 @@ def _restore_sheet_extensions(
                 result[name] = target
         return result
 
+    import re
+
     with zipfile.ZipFile(str(template_path), "r") as tzf:
         tpl_map = _get_sheet_xml_map(tzf)
 
-        # テンプレートから変更シートの<extLst>を抽出
-        ext_data: dict[str, str] = {}  # xml_path → extLst raw XML
+        # テンプレートから変更シートの<extLst>と名前空間宣言を抽出
+        ext_data: dict[str, tuple[str, list[str]]] = {}
         for sheet_name in modified_sheet_names:
             xml_path = tpl_map.get(sheet_name)
             if not xml_path:
                 continue
             raw = tzf.read(xml_path).decode("utf-8")
+
             # <extLst> ... </extLst> を抽出
             start = raw.find("<extLst")
             end = raw.find("</extLst>")
-            if start >= 0 and end >= 0:
-                ext_xml = raw[start:end + len("</extLst>")]
-                ext_data[xml_path] = ext_xml
-                logger.info(
-                    f"拡張要素復元対象: {sheet_name} ({len(ext_xml)}文字)"
-                )
+            if start < 0 or end < 0:
+                continue
+            ext_xml = raw[start:end + len("</extLst>")]
+
+            # テンプレートの<worksheet>タグから名前空間宣言を抽出
+            ws_match = re.search(r"<worksheet\s([^>]+)>", raw)
+            extra_ns: list[str] = []
+            if ws_match:
+                attrs = ws_match.group(1)
+                # xmlns:xxx="..." と mc:Ignorable="..." を収集
+                for ns_match in re.finditer(
+                    r'(xmlns:\w+="[^"]*"|mc:Ignorable="[^"]*"|xr:uid="[^"]*")',
+                    attrs,
+                ):
+                    extra_ns.append(ns_match.group(1))
+
+            ext_data[xml_path] = (ext_xml, extra_ns)
+            logger.info(
+                f"拡張要素復元対象: {sheet_name} "
+                f"({len(ext_xml)}文字, ns={len(extra_ns)})"
+            )
 
     if not ext_data:
         return
 
-    # 出力ファイルに<extLst>を再注入
+    # 出力ファイルに<extLst>と名前空間宣言を再注入
     temp_path = output_path.with_suffix(".tmp2.xlsx")
     with zipfile.ZipFile(str(output_path), "r") as ozf:
         with zipfile.ZipFile(
@@ -307,17 +325,31 @@ def _restore_sheet_extensions(
                 data = ozf.read(item.filename)
                 if item.filename in ext_data:
                     text = data.decode("utf-8")
-                    ext_xml = ext_data[item.filename]
+                    ext_xml, extra_ns = ext_data[item.filename]
+
+                    if "<extLst" in text:
+                        # 既にextLstがあればスキップ
+                        nzf.writestr(item, data)
+                        continue
+
+                    # <worksheet ...> タグに名前空間宣言を追加
+                    for ns_decl in extra_ns:
+                        attr_name = ns_decl.split("=")[0]
+                        if attr_name not in text:
+                            text = text.replace(
+                                "<worksheet ",
+                                f"<worksheet {ns_decl} ",
+                                1,
+                            )
+
                     # </worksheet> の直前に <extLst> を挿入
                     close_tag = "</worksheet>"
-                    if close_tag in text and "<extLst" not in text:
-                        text = text.replace(
-                            close_tag, ext_xml + close_tag,
-                        )
-                        data = text.encode("utf-8")
-                        logger.info(
-                            f"拡張要素復元完了: {item.filename}"
-                        )
+                    text = text.replace(
+                        close_tag, ext_xml + close_tag,
+                    )
+                    data = text.encode("utf-8")
+                    logger.info(f"拡張要素復元完了: {item.filename}")
+
                 nzf.writestr(item, data)
 
     temp_path.replace(output_path)
