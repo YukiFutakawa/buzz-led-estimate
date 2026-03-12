@@ -87,33 +87,20 @@ def _safe_write(ws, row: int, col: int, value) -> None:
 def _save_sheet_formatting(ws) -> dict:
     """openpyxlがsave時に壊す可能性のあるシート書式を保存
 
-    対象: データバリデーション（プルダウン）、条件付き書式、オートフィルタ
+    対象: データバリデーション（標準形式）、オートフィルタ
+    ※条件付き書式はopenpyxlが自動保持するため対象外
+    ※x14拡張バリデーションは _restore_sheet_extensions でZIPレベル復元
     """
     return {
         "data_validations": list(ws.data_validations.dataValidation),
-        "conditional_formatting": list(ws.conditional_formatting),
         "auto_filter_ref": ws.auto_filter.ref if ws.auto_filter.ref else None,
     }
 
 
 def _restore_sheet_formatting(ws, saved: dict) -> None:
     """保存した書式設定を復元"""
-    # データバリデーション（プルダウン等）
     ws.data_validations.dataValidation = saved["data_validations"]
 
-    # 条件付き書式
-    try:
-        ws.conditional_formatting._cf_rules = saved["conditional_formatting"]
-    except (AttributeError, TypeError):
-        # openpyxlバージョン互換: _cf_rules が使えない場合
-        try:
-            ws.conditional_formatting._cf_rules = []
-            for cf in saved["conditional_formatting"]:
-                ws.conditional_formatting.append(cf)
-        except AttributeError:
-            pass  # 復元不可の場合はスキップ（ZIP復元で対応）
-
-    # オートフィルタ
     if saved["auto_filter_ref"]:
         ws.auto_filter.ref = saved["auto_filter_ref"]
 
