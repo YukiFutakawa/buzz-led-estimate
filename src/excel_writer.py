@@ -102,9 +102,16 @@ def _restore_sheet_formatting(ws, saved: dict) -> None:
     ws.data_validations.dataValidation = saved["data_validations"]
 
     # 条件付き書式
-    ws.conditional_formatting._cf_rules = []
-    for cf in saved["conditional_formatting"]:
-        ws.conditional_formatting.append(cf)
+    try:
+        ws.conditional_formatting._cf_rules = saved["conditional_formatting"]
+    except (AttributeError, TypeError):
+        # openpyxlバージョン互換: _cf_rules が使えない場合
+        try:
+            ws.conditional_formatting._cf_rules = []
+            for cf in saved["conditional_formatting"]:
+                ws.conditional_formatting.append(cf)
+        except AttributeError:
+            pass  # 復元不可の場合はスキップ（ZIP復元で対応）
 
     # オートフィルタ
     if saved["auto_filter_ref"]:
