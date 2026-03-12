@@ -162,38 +162,40 @@ def _restore_unmodified_sheets(
         return result
 
     def _get_associated_files(
-        zf: zipfile.ZipFile, sheet_xml_path: str,
+        zf: zipfile.ZipFile, file_path: str,
+        _collected: set[str] | None = None,
     ) -> set[str]:
-        """シートXMLに関連するファイル群（rels, drawings等）を返す"""
-        files = {sheet_xml_path}
+        """ファイルの関連ファイルを再帰的に収集
+
+        sheet XML → rels → drawings → drawing rels → media/charts
+        のように依存チェーン全体をたどり、画像・チャート等も復元対象にする。
+        """
+        if _collected is None:
+            _collected = set()
+        if file_path in _collected:
+            return _collected
+        _collected.add(file_path)
 
         # rels ファイル
-        dir_part, file_part = posixpath.split(sheet_xml_path)
+        dir_part, file_part = posixpath.split(file_path)
         rels_path = posixpath.join(dir_part, "_rels", file_part + ".rels")
         if rels_path not in zf.namelist():
-            return files
-        files.add(rels_path)
+            return _collected
+        _collected.add(rels_path)
 
-        # rels内の参照先（drawings, charts等）
+        # rels内の参照先を再帰的に収集（drawings, charts, media等）
         rels_xml = ET.fromstring(zf.read(rels_path))
-        for elem in rels_xml.iter(f"{{{NS_PKG}}}Relationship"):
-            target = elem.get("Target")
-            if target and not target.startswith("http"):
-                resolved = posixpath.normpath(
-                    posixpath.join(dir_part, target)
-                )
-                if resolved in zf.namelist():
-                    files.add(resolved)
-        for elem in rels_xml.iter("Relationship"):
-            target = elem.get("Target")
-            if target and not target.startswith("http"):
-                resolved = posixpath.normpath(
-                    posixpath.join(dir_part, target)
-                )
-                if resolved in zf.namelist():
-                    files.add(resolved)
+        for tag in (f"{{{NS_PKG}}}Relationship", "Relationship"):
+            for elem in rels_xml.iter(tag):
+                target = elem.get("Target")
+                if target and not target.startswith("http"):
+                    resolved = posixpath.normpath(
+                        posixpath.join(dir_part, target)
+                    )
+                    if resolved in zf.namelist():
+                        _get_associated_files(zf, resolved, _collected)
 
-        return files
+        return _collected
 
     with zipfile.ZipFile(str(template_path), "r") as tzf:
         sheet_map = _get_sheet_xml_map(tzf)
@@ -220,11 +222,20 @@ def _restore_unmodified_sheets(
         with zipfile.ZipFile(
             str(temp_path), "w", zipfile.ZIP_DEFLATED,
         ) as nzf:
+            written: set[str] = set()
             for item in ozf.infolist():
                 if item.filename in files_to_restore:
                     nzf.writestr(item, files_to_restore[item.filename])
                 else:
                     nzf.writestr(item, ozf.read(item.filename))
+                written.add(item.filename)
+
+            # テンプレートにのみ存在するファイルを追加
+            # （openpyxlが削除した drawing rels, media等）
+            for fname, data in files_to_restore.items():
+                if fname not in written:
+                    nzf.writestr(fname, data)
+                    logger.debug(f"テンプレートから追加復元: {fname}")
 
     temp_path.replace(output_path)
 
