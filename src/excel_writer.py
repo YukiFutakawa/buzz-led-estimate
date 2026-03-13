@@ -1,12 +1,20 @@
-"""見積テンプレートExcelへのデータ書き込み"""
+"""見積テンプレートExcelへのデータ書き込み
+
+openpyxlはセル値の追跡用にのみ使用し、最終出力はテンプレートZIPに対して
+XMLレベルのセル値パッチ + ZIPレベルの画像挿入で生成する。
+これによりopenpyxlのload→saveが壊す書式・画像・数式等の問題を回避する。
+"""
 
 from __future__ import annotations
 
+import io
 import logging
 import posixpath
+import re
 import shutil
 import xml.etree.ElementTree as ET
 import zipfile
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
@@ -31,7 +39,6 @@ from image_handler import (
     LineupImageIndex,
     resize_for_cell,
     prepare_fixture_photo,
-    insert_image_to_cell,
     BREAKDOWN_PHOTO_W, BREAKDOWN_PHOTO_H,
     EXCLUSION_PHOTO_W, EXCLUSION_PHOTO_H,
     SELECTION_PHOTO1_W, SELECTION_PHOTO2_W, SELECTION_PHOTO_H,
@@ -45,6 +52,48 @@ ROW_LABELS = [
     "K", "L", "M", "N", "O", "P", "Q", "R", "S", "T",
     "U", "V", "W", "Z", "Y", "Z", "AA", "AB", "AC", "AD",
 ]
+
+# XML 名前空間定数
+NS_MAIN = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+NS_R = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+NS_PKG = "http://schemas.openxmlformats.org/package/2006/relationships"
+
+# EMU変換定数 (1ピクセル = 9525 EMU at 96 DPI)
+EMU_PER_PIXEL = 9525
+
+
+@dataclass
+class ImagePlacement:
+    """ZIPレベル画像挿入のための配置情報
+
+    Attributes:
+        sheet_name: シート名（例: "選定"）
+        image_data: JPEG/PNGバイトデータ
+        row: セル行番号 (0-based)
+        col: セル列番号 (0-based)
+        width_px: 表示幅 (px)
+        height_px: 表示高さ (px)
+        col_offset_emu: 列オフセット (EMU単位, 中央配置用)
+        row_offset_emu: 行オフセット (EMU単位, 中央配置用)
+    """
+    sheet_name: str
+    image_data: bytes
+    row: int           # 0-based
+    col: int           # 0-based
+    width_px: int
+    height_px: int
+    col_offset_emu: int = 0
+    row_offset_emu: int = 0
+
+
+def _detect_image_format(data: bytes) -> str:
+    """画像データのフォーマットを判定"""
+    if data[:8] == b'\x89PNG\r\n\x1a\n':
+        return "png"
+    if data[:2] == b'\xff\xd8':
+        return "jpeg"
+    # デフォルトはJPEG（resize_for_cellがJPEGを返すため）
+    return "jpeg"
 
 
 def _get_sheet_names(template_name: str) -> dict[str, str]:
@@ -62,333 +111,732 @@ def _col_to_idx(col_letter: str) -> int:
     return result
 
 
-def _safe_write(ws, row: int, col: int, value) -> None:
-    """結合セルを考慮した安全な書き込み
+def _safe_write(
+    ws, row: int, col: int, value,
+    tracker: dict[str, list[tuple[int, int, object]]] | None = None,
+) -> None:
+    """結合セルを考慮した安全な書き込み（セル追跡付き）"""
+    actual_row, actual_col = row, col
 
-    結合セルに書き込もうとした場合、その結合範囲の左上セルに書き込む。
-    """
     cell = ws.cell(row=row, column=col)
-    if not isinstance(cell, openpyxl.cell.cell.MergedCell):
-        cell.value = value
-        return
+    if isinstance(cell, openpyxl.cell.cell.MergedCell):
+        for merged_range in ws.merged_cells.ranges:
+            if (merged_range.min_row <= row <= merged_range.max_row and
+                    merged_range.min_col <= col <= merged_range.max_col):
+                actual_row = merged_range.min_row
+                actual_col = merged_range.min_col
+                cell = ws.cell(row=actual_row, column=actual_col)
+                break
 
-    # MergedCellの場合: 結合範囲の左上セルを探す
-    for merged_range in ws.merged_cells.ranges:
-        if (merged_range.min_row <= row <= merged_range.max_row and
-                merged_range.min_col <= col <= merged_range.max_col):
-            ws.cell(row=merged_range.min_row,
-                    column=merged_range.min_col).value = value
-            return
-
-    # フォールバック: そのまま書き込む
     cell.value = value
 
-
-def _save_sheet_formatting(ws) -> dict:
-    """openpyxlがsave時に壊す可能性のあるシート書式を保存
-
-    対象: データバリデーション（標準形式）、オートフィルタ
-    ※条件付き書式はopenpyxlが自動保持するため対象外
-    ※x14拡張バリデーションは _restore_sheet_extensions でZIPレベル復元
-    """
-    return {
-        "data_validations": list(ws.data_validations.dataValidation),
-        "auto_filter_ref": ws.auto_filter.ref if ws.auto_filter.ref else None,
-    }
+    if tracker is not None:
+        sheet_name = ws.title
+        if sheet_name not in tracker:
+            tracker[sheet_name] = []
+        tracker[sheet_name].append((actual_row, actual_col, value))
 
 
-def _restore_sheet_formatting(ws, saved: dict) -> None:
-    """保存した書式設定を復元"""
-    ws.data_validations.dataValidation = saved["data_validations"]
+# ─────────────────────────────────────────────────────────
+# テンプレートベース ZIP 再構築
+# ─────────────────────────────────────────────────────────
 
-    if saved["auto_filter_ref"]:
-        ws.auto_filter.ref = saved["auto_filter_ref"]
+def _get_sheet_xml_map(zf: zipfile.ZipFile) -> dict[str, str]:
+    """シート名 → ZIP内XMLパスのマッピングを返す"""
+    wb_xml = ET.fromstring(zf.read("xl/workbook.xml"))
 
+    sheet_rids: dict[str, str] = {}
+    for elem in wb_xml.iter(f"{{{NS_MAIN}}}sheet"):
+        name = elem.get("name")
+        rid = elem.get(f"{{{NS_R}}}id")
+        if name and rid:
+            sheet_rids[name] = rid
 
-def _restore_unmodified_sheets(
-    template_path: Path, output_path: Path,
-    modified_sheet_names: set[str],
-) -> None:
-    """openpyxl保存後、未変更シートのXMLをテンプレートから復元
-
-    openpyxlはload→save時にすべてのシートを再シリアライズするため、
-    書き込み対象外のシート（①表紙～⑧見積書等）のレイアウト・書式・
-    チャート等が壊れることがある。この関数はZIPレベルで元のXMLを復元する。
-    """
-    NS_MAIN = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
-    NS_R = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
-    NS_PKG = "http://schemas.openxmlformats.org/package/2006/relationships"
-
-    def _get_sheet_xml_map(zf: zipfile.ZipFile) -> dict[str, str]:
-        """シート名 → ZIP内XMLパスのマッピングを返す"""
-        wb_xml = ET.fromstring(zf.read("xl/workbook.xml"))
-
-        # sheet name → rId
-        sheet_rids: dict[str, str] = {}
-        for elem in wb_xml.iter(f"{{{NS_MAIN}}}sheet"):
-            name = elem.get("name")
-            rid = elem.get(f"{{{NS_R}}}id")
-            if name and rid:
-                sheet_rids[name] = rid
-
-        # rId → target path
-        rels_xml = ET.fromstring(
-            zf.read("xl/_rels/workbook.xml.rels")
-        )
-        rid_targets: dict[str, str] = {}
-        for elem in rels_xml.iter(f"{{{NS_PKG}}}Relationship"):
-            rid_targets[elem.get("Id")] = elem.get("Target")
-        # Fallback: namespace なしの Relationship 要素
-        for elem in rels_xml.iter("Relationship"):
+    rels_xml = ET.fromstring(zf.read("xl/_rels/workbook.xml.rels"))
+    rid_targets: dict[str, str] = {}
+    for tag in (f"{{{NS_PKG}}}Relationship", "Relationship"):
+        for elem in rels_xml.iter(tag):
             rid = elem.get("Id")
             if rid and rid not in rid_targets:
                 rid_targets[rid] = elem.get("Target")
 
-        result: dict[str, str] = {}
-        for name, rid in sheet_rids.items():
-            target = rid_targets.get(rid)
-            if target:
-                if not target.startswith("/"):
-                    target = f"xl/{target}"
-                else:
-                    target = target.lstrip("/")
-                result[name] = target
-        return result
+    result: dict[str, str] = {}
+    for name, rid in sheet_rids.items():
+        target = rid_targets.get(rid)
+        if target:
+            if not target.startswith("/"):
+                target = f"xl/{target}"
+            else:
+                target = target.lstrip("/")
+            result[name] = target
+    return result
 
-    def _get_associated_files(
-        zf: zipfile.ZipFile, file_path: str,
-        _collected: set[str] | None = None,
-    ) -> set[str]:
-        """ファイルの関連ファイルを再帰的に収集
 
-        sheet XML → rels → drawings → drawing rels → media/charts
-        のように依存チェーン全体をたどり、画像・チャート等も復元対象にする。
-        """
-        if _collected is None:
-            _collected = set()
-        if file_path in _collected:
-            return _collected
-        _collected.add(file_path)
+def _get_sheet_drawing_map(zf: zipfile.ZipFile) -> dict[str, str]:
+    """シートXMLパス → drawing XMLパスのマッピングを返す
 
-        # rels ファイル
-        dir_part, file_part = posixpath.split(file_path)
+    各シートの.relsファイルを読み、drawing参照を探す。
+    例: xl/worksheets/sheet2.xml → xl/drawings/drawing2.xml
+    """
+    result: dict[str, str] = {}
+    sheet_xml_map = _get_sheet_xml_map(zf)
+
+    for sheet_name, sheet_xml_path in sheet_xml_map.items():
+        dir_part, file_part = posixpath.split(sheet_xml_path)
         rels_path = posixpath.join(dir_part, "_rels", file_part + ".rels")
+
         if rels_path not in zf.namelist():
-            return _collected
-        _collected.add(rels_path)
+            continue
 
-        # rels内の参照先を再帰的に収集（drawings, charts, media等）
-        rels_xml = ET.fromstring(zf.read(rels_path))
-        for tag in (f"{{{NS_PKG}}}Relationship", "Relationship"):
-            for elem in rels_xml.iter(tag):
-                target = elem.get("Target")
-                if target and not target.startswith("http"):
-                    resolved = posixpath.normpath(
-                        posixpath.join(dir_part, target)
-                    )
-                    if resolved in zf.namelist():
-                        _get_associated_files(zf, resolved, _collected)
+        rels_text = zf.read(rels_path).decode("utf-8")
+        # drawing参照を探す
+        for m in re.finditer(
+            r'<Relationship[^>]*?'
+            r'Type="[^"]*?/drawing"[^>]*?'
+            r'Target="([^"]+)"[^>]*?/>',
+            rels_text,
+        ):
+            target = m.group(1)
+            # 相対パスを絶対パスに変換
+            if not target.startswith("/"):
+                drawing_path = posixpath.normpath(
+                    posixpath.join(dir_part, target)
+                )
+            else:
+                drawing_path = target.lstrip("/")
+            result[sheet_name] = drawing_path
+            break  # 1シートに1drawingのみ
 
-        return _collected
+    return result
 
-    with zipfile.ZipFile(str(template_path), "r") as tzf:
-        sheet_map = _get_sheet_xml_map(tzf)
 
-        # 復元対象ファイルを収集（未変更シートの関連ファイル）
-        files_to_restore: dict[str, bytes] = {}
-        for sheet_name, xml_path in sheet_map.items():
-            if sheet_name in modified_sheet_names:
-                continue
-            for fpath in _get_associated_files(tzf, xml_path):
-                files_to_restore[fpath] = tzf.read(fpath)
+def _xml_escape(text: str) -> str:
+    """XML用エスケープ"""
+    return (
+        text.replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+        .replace("'", "&apos;")
+    )
 
-        # 変更シートのrels・printerSettings等もテンプレートから復元
-        # （openpyxlがシートXMLは作るが、rels/printerSettingsを落とす）
-        for sheet_name in modified_sheet_names:
-            xml_path = sheet_map.get(sheet_name)
-            if not xml_path:
-                continue
-            dir_part, file_part = posixpath.split(xml_path)
-            rels_path = posixpath.join(
-                dir_part, "_rels", file_part + ".rels",
+
+def _patch_sheet_xml(
+    template_xml: bytes,
+    writes: list[tuple[int, int, object]],
+) -> bytes:
+    """テンプレートシートXMLにセル値をパッチして返す
+
+    テンプレートのXMLを文字列レベルで操作し、指定セルの値のみ差し替える。
+    スタイル(s属性)は元のまま保持されるため、書式が壊れない。
+    文字列値はインライン文字列(t="inlineStr")で書き込み、
+    sharedStrings.xmlへの依存を避ける。
+    新規セル挿入時は列順序を維持する（列順序違反は修復ダイアログの原因）。
+    """
+    text = template_xml.decode("utf-8")
+
+    for row_num, col_num, value in writes:
+        if value is None:
+            continue
+
+        col_letter = get_column_letter(col_num)
+        cell_ref = f"{col_letter}{row_num}"
+
+        # 値のXML表現を構築
+        if isinstance(value, bool):
+            val_xml = "<v>1</v>" if value else "<v>0</v>"
+            t_attr = ' t="b"'
+        elif isinstance(value, (int, float)):
+            val_xml = f"<v>{value}</v>"
+            t_attr = ""
+        else:
+            escaped = _xml_escape(str(value))
+            val_xml = f"<is><t>{escaped}</t></is>"
+            t_attr = ' t="inlineStr"'
+
+        # 既存セル要素を検索: <c r="C5" ...>...</c> or <c r="C5" .../>
+        pattern = re.compile(
+            rf'<c\s[^>]*?r="{re.escape(cell_ref)}"[^/]*?/>'
+            rf'|<c\s[^>]*?r="{re.escape(cell_ref)}"[^>]*?>.*?</c>',
+            re.DOTALL,
+        )
+        m = pattern.search(text)
+
+        if m:
+            # 既存セルのスタイル属性を抽出して保持
+            old_cell = m.group(0)
+            s_match = re.search(r's="(\d+)"', old_cell)
+            s_attr = f' s="{s_match.group(1)}"' if s_match else ""
+
+            new_cell = f'<c r="{cell_ref}"{s_attr}{t_attr}>{val_xml}</c>'
+            text = text[: m.start()] + new_cell + text[m.end():]
+        else:
+            # セルが存在しない → 対応する行に追加（列順序を維持）
+            new_c = f'<c r="{cell_ref}"{t_attr}>{val_xml}</c>'
+
+            row_open_pat = re.compile(
+                rf'<row\s[^>]*?r="{row_num}"[^>]*?(/?)>'
             )
-            if rels_path in tzf.namelist():
-                files_to_restore[rels_path] = tzf.read(rels_path)
-                # rels内の参照先（printerSettings等）も復元
-                rels_xml = ET.fromstring(tzf.read(rels_path))
-                for tag in (f"{{{NS_PKG}}}Relationship", "Relationship"):
-                    for elem in rels_xml.iter(tag):
-                        target = elem.get("Target")
-                        if target and not target.startswith("http"):
-                            resolved = posixpath.normpath(
-                                posixpath.join(dir_part, target)
+            rm = row_open_pat.search(text)
+            if rm:
+                if rm.group(1) == "/":
+                    # 自己閉じ行 → 開いてセルを挿入
+                    replacement = rm.group(0)[:-2] + ">" + new_c + "</row>"
+                    text = text[: rm.start()] + replacement + text[rm.end():]
+                else:
+                    # 既存の行内で正しい列位置を探す
+                    row_tag_end = rm.end()
+                    close_pos = text.find("</row>", row_tag_end)
+                    if close_pos < 0:
+                        close_pos = row_tag_end
+                    row_body = text[row_tag_end:close_pos]
+
+                    # 既存セルの列位置をスキャンして挿入位置を決定
+                    insert_offset = len(row_body)  # デフォルト: 末尾
+                    cell_pat = re.compile(
+                        r'<c\s[^>]*?r="([A-Z]+)\d+"'
+                    )
+                    for cm in cell_pat.finditer(row_body):
+                        existing_col = cm.group(1)
+                        if _col_to_idx(existing_col) > col_num:
+                            insert_offset = cm.start()
+                            break
+
+                    abs_insert = row_tag_end + insert_offset
+                    text = text[:abs_insert] + new_c + text[abs_insert:]
+            else:
+                # 行も存在しない → </sheetData> の直前に追加
+                sd_end = text.find("</sheetData>")
+                if sd_end > 0:
+                    new_row = (
+                        f'<row r="{row_num}">'
+                        f'<c r="{cell_ref}"{t_attr}>{val_xml}</c>'
+                        f"</row>"
+                    )
+                    text = text[:sd_end] + new_row + text[sd_end:]
+
+    return text.encode("utf-8")
+
+
+def _set_full_calc_on_load(wb_xml_bytes: bytes) -> bytes:
+    """workbook.xmlの<calcPr>にfullCalcOnLoad="1"を設定"""
+    text = wb_xml_bytes.decode("utf-8")
+
+    calcpr_pattern = re.compile(r"<calcPr\s([^/]*?)/>|<calcPr\s([^>]*?)>")
+    m = calcpr_pattern.search(text)
+
+    if m:
+        old_tag = m.group(0)
+        if "fullCalcOnLoad" in old_tag:
+            new_tag = re.sub(
+                r'fullCalcOnLoad="[^"]*"',
+                'fullCalcOnLoad="1"',
+                old_tag,
+            )
+        else:
+            new_tag = old_tag.replace("<calcPr ", '<calcPr fullCalcOnLoad="1" ')
+        text = text.replace(old_tag, new_tag)
+    else:
+        insert_pos = text.rfind("</workbook>")
+        if insert_pos > 0:
+            text = (
+                text[:insert_pos]
+                + '<calcPr fullCalcOnLoad="1"/>'
+                + text[insert_pos:]
+            )
+
+    return text.encode("utf-8")
+
+
+def _inject_images_into_zip(
+    nzf: zipfile.ZipFile,
+    tzf: zipfile.ZipFile,
+    image_placements: list[ImagePlacement],
+    sheet_drawing_map: dict[str, str],
+    sheet_xml_map: dict[str, str],
+) -> tuple[set[str], dict[str, str], list[str]]:
+    """ZIPレベルで画像をdrawing XMLに挿入する
+
+    drawingが存在しないシートには新規drawing XMLを作成し、
+    シートrelsとシートXMLにdrawing参照を追加する。
+
+    Returns:
+        (modified_paths, sheet_rels_patches, new_content_type_overrides)
+    """
+    if not image_placements:
+        return set(), {}, []
+
+    drawing_images: dict[str, list[tuple[ImagePlacement, int]]] = {}
+    media_files: dict[str, bytes] = {}
+
+    existing_media = [
+        n for n in tzf.namelist() if n.startswith("xl/media/")
+    ]
+    media_counter = len(existing_media) + 1
+
+    # 既存drawingの最大番号を取得
+    drawing_nums = []
+    for n in tzf.namelist():
+        dm = re.search(r'drawing(\d+)\.xml$', n)
+        if dm:
+            drawing_nums.append(int(dm.group(1)))
+    next_drawing_num = max(drawing_nums, default=0) + 1
+
+    # drawingが無いシートに新規drawingを作成
+    sheets_needing_drawing: dict[str, str] = {}
+    sheet_rels_patches: dict[str, str] = {}
+    new_content_type_overrides: list[str] = []
+
+    for placement in image_placements:
+        drawing_path = sheet_drawing_map.get(placement.sheet_name)
+        if not drawing_path:
+            if placement.sheet_name in sheets_needing_drawing:
+                drawing_path = sheets_needing_drawing[placement.sheet_name]
+            else:
+                new_drawing_path = f"xl/drawings/drawing{next_drawing_num}.xml"
+                sheets_needing_drawing[placement.sheet_name] = new_drawing_path
+                sheet_drawing_map[placement.sheet_name] = new_drawing_path
+                drawing_path = new_drawing_path
+
+                sheet_xml_path = sheet_xml_map.get(placement.sheet_name)
+                if sheet_xml_path:
+                    dir_part, file_part = posixpath.split(sheet_xml_path)
+                    sheet_rels_path = posixpath.join(
+                        dir_part, "_rels", file_part + ".rels"
+                    )
+                    _existing_rids = []
+                    if sheet_rels_path in tzf.namelist():
+                        _sr = tzf.read(sheet_rels_path).decode("utf-8")
+                        _existing_rids = [
+                            int(x) for x in re.findall(
+                                r'Id="rId(\d+)"', _sr
                             )
-                            if resolved in tzf.namelist():
-                                files_to_restore[resolved] = (
-                                    tzf.read(resolved)
-                                )
+                        ]
+                    _rid = max(_existing_rids, default=0) + 1
+                    _rid_str = f"rId{_rid}"
+                    drawing_rel_target = (
+                        f"../drawings/drawing{next_drawing_num}.xml"
+                    )
+                    sheet_rels_patches[sheet_rels_path] = (
+                        f'<Relationship Id="{_rid_str}" '
+                        f'Type="http://schemas.openxmlformats.org/officeDocument'
+                        f'/2006/relationships/drawing" '
+                        f'Target="{drawing_rel_target}"/>'
+                    )
 
-        # ※ sharedStrings.xml / calcChain.xml は復元しない
-        # openpyxlがセル内容を変更するため、テンプレートのものは不整合になる
-        # Excelが開く時に自動再生成するので問題ない
+                new_content_type_overrides.append(
+                    f'<Override PartName="/{new_drawing_path}" '
+                    f'ContentType="application/vnd.openxmlformats-'
+                    f'officedocument.drawing+xml"/>'
+                )
+                logger.info(
+                    f"新規drawing作成予定: {new_drawing_path} "
+                    f"(シート={placement.sheet_name})"
+                )
+                next_drawing_num += 1
 
-        # customXmlファイルを復元
-        for fname in tzf.namelist():
-            if fname.startswith("customXml/"):
-                files_to_restore[fname] = tzf.read(fname)
+        fmt = _detect_image_format(placement.image_data)
+        ext = "png" if fmt == "png" else "jpeg"
+        media_name = f"xl/media/image{media_counter}.{ext}"
+        media_files[media_name] = placement.image_data
 
-        if not files_to_restore:
-            return
+        if drawing_path not in drawing_images:
+            drawing_images[drawing_path] = []
+        drawing_images[drawing_path].append((placement, media_counter))
+        media_counter += 1
+
+    modified_drawings: set[str] = set()
+
+    for drawing_path, placements_with_ids in drawing_images.items():
+        # drawingのrelsパスを構築
+        dir_part, file_part = posixpath.split(drawing_path)
+        rels_path = posixpath.join(dir_part, "_rels", file_part + ".rels")
+
+        # テンプレートのdrawing XMLを読む（新規は空テンプレート）
+        if drawing_path in tzf.namelist():
+            drawing_xml = tzf.read(drawing_path).decode("utf-8")
+        elif drawing_path in sheets_needing_drawing.values():
+            drawing_xml = (
+                '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+                '<xdr:wsDr xmlns:xdr='
+                '"http://schemas.openxmlformats.org/drawingml/2006/'
+                'spreadsheetDrawing" '
+                'xmlns:a='
+                '"http://schemas.openxmlformats.org/drawingml/2006/main">'
+                '</xdr:wsDr>'
+            )
+        else:
+            logger.warning(f"drawing XMLが見つかりません: {drawing_path}")
+            continue
+
+        # テンプレートのdrawing relsを読む（無い場合は空を作成）
+        if rels_path in tzf.namelist():
+            rels_xml = tzf.read(rels_path).decode("utf-8")
+        else:
+            rels_xml = (
+                '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+                '<Relationships xmlns='
+                '"http://schemas.openxmlformats.org/package/2006/relationships">'
+                '</Relationships>'
+            )
+
+        # 既存のrId番号の最大値を取得
+        existing_rids = [
+            int(x) for x in re.findall(r'Id="rId(\d+)"', rels_xml)
+        ]
+        next_rid = max(existing_rids, default=0) + 1
+
+        # 各画像のoneCellAnchorとrels Relationshipを生成
+        new_anchors = []
+        new_rels = []
+
+        for placement, media_id in placements_with_ids:
+            rid = f"rId{next_rid}"
+            next_rid += 1
+
+            fmt = _detect_image_format(placement.image_data)
+            ext = "png" if fmt == "png" else "jpeg"
+
+            # drawingからmediaへの相対パス
+            media_target = f"../media/image{media_id}.{ext}"
+
+            # Relationship追加
+            new_rels.append(
+                f'<Relationship Id="{rid}" '
+                f'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" '
+                f'Target="{media_target}"/>'
+            )
+
+            # oneCellAnchor XML
+            cx = placement.width_px * EMU_PER_PIXEL
+            cy = placement.height_px * EMU_PER_PIXEL
+            col_off = placement.col_offset_emu
+            row_off = placement.row_offset_emu
+
+            anchor_xml = (
+                '<xdr:oneCellAnchor>'
+                '<xdr:from>'
+                f'<xdr:col>{placement.col}</xdr:col>'
+                f'<xdr:colOff>{col_off}</xdr:colOff>'
+                f'<xdr:row>{placement.row}</xdr:row>'
+                f'<xdr:rowOff>{row_off}</xdr:rowOff>'
+                '</xdr:from>'
+                f'<xdr:ext cx="{cx}" cy="{cy}"/>'
+                '<xdr:pic>'
+                '<xdr:nvPicPr>'
+                f'<xdr:cNvPr id="{media_id + 100}" name="Picture {media_id}"/>'
+                '<xdr:cNvPicPr><a:picLocks noChangeAspect="1"/></xdr:cNvPicPr>'
+                '</xdr:nvPicPr>'
+                '<xdr:blipFill>'
+                f'<a:blip xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" r:embed="{rid}"/>'
+                '<a:stretch><a:fillRect/></a:stretch>'
+                '</xdr:blipFill>'
+                '<xdr:spPr>'
+                f'<a:xfrm><a:off x="0" y="0"/><a:ext cx="{cx}" cy="{cy}"/></a:xfrm>'
+                '<a:prstGeom prst="rect"><a:avLst/></a:prstGeom>'
+                '</xdr:spPr>'
+                '</xdr:pic>'
+                '<xdr:clientData/>'
+                '</xdr:oneCellAnchor>'
+            )
+            new_anchors.append(anchor_xml)
+
+        # drawing XMLに名前空間宣言を確認・追加
+        if 'xmlns:a=' not in drawing_xml:
+            drawing_xml = drawing_xml.replace(
+                'xmlns:xdr=',
+                'xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:xdr=',
+            )
+
+        # </xdr:wsDr> の直前にanchorを挿入
+        close_tag = "</xdr:wsDr>"
+        close_pos = drawing_xml.rfind(close_tag)
+        if close_pos >= 0:
+            drawing_xml = (
+                drawing_xml[:close_pos]
+                + "".join(new_anchors)
+                + drawing_xml[close_pos:]
+            )
+
+        # relsに新しいRelationshipを挿入
+        rels_close = "</Relationships>"
+        rels_close_pos = rels_xml.rfind(rels_close)
+        if rels_close_pos >= 0:
+            rels_xml = (
+                rels_xml[:rels_close_pos]
+                + "".join(new_rels)
+                + rels_xml[rels_close_pos:]
+            )
+
+        # 変更後のdrawing XMLとrelsをZIPに書き込む
+        nzf.writestr(drawing_path, drawing_xml.encode("utf-8"))
+        nzf.writestr(rels_path, rels_xml.encode("utf-8"))
+        modified_drawings.add(drawing_path)
+        modified_drawings.add(rels_path)
 
         logger.info(
-            f"テンプレート復元: {len(files_to_restore)}ファイル "
-            f"({len(sheet_map) - len(modified_sheet_names)}シート分)"
+            f"drawing画像挿入: {drawing_path} に "
+            f"{len(placements_with_ids)}枚追加"
         )
 
-    # 出力ZIPを再構築
-    temp_path = output_path.with_suffix(".tmp.xlsx")
-    with zipfile.ZipFile(str(output_path), "r") as ozf:
-        out_names = set(ozf.namelist())
-        with zipfile.ZipFile(
-            str(temp_path), "w", zipfile.ZIP_DEFLATED,
-        ) as nzf:
-            written: set[str] = set()
-            for item in ozf.infolist():
-                if item.filename in files_to_restore:
-                    nzf.writestr(item, files_to_restore[item.filename])
-                else:
-                    nzf.writestr(item, ozf.read(item.filename))
-                written.add(item.filename)
+    # mediaファイルをZIPに追加
+    for media_name, data in media_files.items():
+        nzf.writestr(media_name, data)
 
-            # テンプレートにのみ存在するファイルを追加
-            for fname, data in files_to_restore.items():
-                if fname not in written:
-                    nzf.writestr(fname, data)
-                    logger.debug(f"テンプレートから追加復元: {fname}")
-
-    temp_path.replace(output_path)
+    return modified_drawings, sheet_rels_patches, new_content_type_overrides
 
 
-def _restore_sheet_extensions(
-    template_path: Path, output_path: Path,
-    modified_sheet_names: set[str],
-) -> None:
-    """変更シートのExtension要素(x14:dataValidations等)をテンプレートから復元
+def _ensure_content_types_for_images(ct_text: str) -> str:
+    """Content_Types.xmlにjpeg/png拡張子の型定義があるか確認し、無ければ追加"""
+    needs = []
+    if 'Extension="jpeg"' not in ct_text and 'Extension="jpg"' not in ct_text:
+        needs.append('<Default Extension="jpeg" ContentType="image/jpeg"/>')
+    if 'Extension="png"' not in ct_text:
+        needs.append('<Default Extension="png" ContentType="image/png"/>')
 
-    openpyxlはExcel 2010+の拡張データ入力規則(<extLst>内の
-    <x14:dataValidations>)に対応しておらず、load→save時に削除する。
-    この関数はテンプレートの<extLst>を変更シートのXMLに再注入する。
+    if not needs:
+        return ct_text
+
+    # <Types ...> の直後に追加
+    insert_pos = ct_text.find(">", ct_text.find("<Types")) + 1
+    if insert_pos > 0:
+        ct_text = ct_text[:insert_pos] + "".join(needs) + ct_text[insert_pos:]
+
+    return ct_text
+
+
+def _patch_sheet_rels(rels_text: str, new_rel_xml: str) -> str:
+    """シートrelsに新しいRelationshipを追加（rIdは計算済み）"""
+    close_tag = "</Relationships>"
+    close_pos = rels_text.rfind(close_tag)
+    if close_pos >= 0:
+        rels_text = (
+            rels_text[:close_pos] + new_rel_xml + rels_text[close_pos:]
+        )
+    return rels_text
+
+
+def _add_drawing_ref_to_sheet(
+    sheet_data: bytes,
+    sheet_xml_path: str,
+    sheet_rels_patches: dict[str, str],
+) -> bytes:
+    """シートXMLに<drawing r:id="..."/>要素を追加（まだ無い場合）
+
+    OOXMLスキーマでは<worksheet>直下の要素順序が厳密に定められている。
+    <drawing>はこの位置に入る:
+      ... → pageSetup → headerFooter → drawing → ... →
+      colBreaks → rowBreaks → ... → tableParts → extLst
+    つまり<drawing>は pageSetup/headerFooter の後、
+    colBreaks/rowBreaks/tableParts/extLst の前に配置する。
     """
-    NS_MAIN = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
-    NS_R = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
-    NS_PKG = "http://schemas.openxmlformats.org/package/2006/relationships"
+    dir_part, file_part = posixpath.split(sheet_xml_path)
+    rels_path = posixpath.join(dir_part, "_rels", file_part + ".rels")
 
-    def _get_sheet_xml_map(zf: zipfile.ZipFile) -> dict[str, str]:
-        wb_xml = ET.fromstring(zf.read("xl/workbook.xml"))
-        sheet_rids: dict[str, str] = {}
-        for elem in wb_xml.iter(f"{{{NS_MAIN}}}sheet"):
-            name = elem.get("name")
-            rid = elem.get(f"{{{NS_R}}}id")
-            if name and rid:
-                sheet_rids[name] = rid
-        rels_xml = ET.fromstring(zf.read("xl/_rels/workbook.xml.rels"))
-        rid_targets: dict[str, str] = {}
-        for tag in (f"{{{NS_PKG}}}Relationship", "Relationship"):
-            for elem in rels_xml.iter(tag):
-                rid = elem.get("Id")
-                if rid and rid not in rid_targets:
-                    rid_targets[rid] = elem.get("Target")
-        result: dict[str, str] = {}
-        for name, rid in sheet_rids.items():
-            target = rid_targets.get(rid)
-            if target:
-                if not target.startswith("/"):
-                    target = f"xl/{target}"
-                else:
-                    target = target.lstrip("/")
-                result[name] = target
-        return result
+    if rels_path not in sheet_rels_patches:
+        return sheet_data
 
-    import re
+    text = sheet_data.decode("utf-8") if isinstance(sheet_data, bytes) else sheet_data
 
+    if re.search(r'<drawing\s', text):
+        return text.encode("utf-8") if isinstance(sheet_data, bytes) else sheet_data
+
+    patch_xml = sheet_rels_patches[rels_path]
+    rid_match = re.search(r'Id="(rId\d+)"', patch_xml)
+    rid_val = rid_match.group(1) if rid_match else "rId1"
+
+    drawing_elem = f'<drawing r:id="{rid_val}"/>'
+
+    # OOXMLスキーマ順序 (CT_Worksheet):
+    # ... → pageSetup → headerFooter → rowBreaks → colBreaks →
+    # customProperties → cellWatches → ignoredErrors → smartTags →
+    # drawing → legacyDrawing → legacyDrawingHF → drawingHF →
+    # picture → oleObjects → controls → webPublishItems →
+    # tableParts → extLst → </worksheet>
+    #
+    # <drawing>より「後」に来る要素の直前に挿入する
+    _AFTER_DRAWING = [
+        r'<legacyDrawing[\s/>]',
+        r'<legacyDrawingHF[\s/>]',
+        r'<drawingHF[\s/>]',
+        r'<picture[\s/>]',
+        r'<oleObjects[\s/>]',
+        r'<controls[\s/>]',
+        r'<webPublishItems[\s/>]',
+        r'<tableParts[\s/>]',
+        r'<extLst[\s/>]',
+        r'</worksheet>',
+    ]
+
+    insert_pos = None
+    for pattern in _AFTER_DRAWING:
+        m = re.search(pattern, text)
+        if m:
+            insert_pos = m.start()
+            break
+
+    if insert_pos is not None:
+        text = text[:insert_pos] + drawing_elem + text[insert_pos:]
+    else:
+        # フォールバック: </worksheet>の前
+        ws_close_pos = text.rfind("</worksheet>")
+        if ws_close_pos >= 0:
+            text = text[:ws_close_pos] + drawing_elem + text[ws_close_pos:]
+
+    return text.encode("utf-8") if isinstance(sheet_data, bytes) else text
+
+
+def _rebuild_from_template(
+    template_path: Path,
+    output_path: Path,
+    modified_sheet_names: set[str],
+    cell_writes: dict[str, list[tuple[int, int, object]]],
+    image_placements: list[ImagePlacement] | None = None,
+) -> None:
+    """テンプレートZIPベースで出力ファイルを完全再構築
+
+    openpyxlの出力を完全に破棄し、テンプレートZIPに対して:
+    1. セル値パッチ（XMLレベル）
+    2. 画像挿入（ZIPレベル: drawing XML + rels + media）
+    3. calcChain除去 + fullCalcOnLoad設定
+    のみ行う。openpyxlの保存結果は一切使わない。
+    """
     with zipfile.ZipFile(str(template_path), "r") as tzf:
-        tpl_map = _get_sheet_xml_map(tzf)
+        tpl_sheet_map = _get_sheet_xml_map(tzf)
+        sheet_drawing_map = _get_sheet_drawing_map(tzf)
 
-        # テンプレートから変更シートの<extLst>と名前空間宣言を抽出
-        ext_data: dict[str, tuple[str, list[str]]] = {}
+        # 変更シートXMLにセル値をパッチ
+        patched_sheets: dict[str, bytes] = {}
         for sheet_name in modified_sheet_names:
-            xml_path = tpl_map.get(sheet_name)
+            xml_path = tpl_sheet_map.get(sheet_name)
             if not xml_path:
                 continue
-            raw = tzf.read(xml_path).decode("utf-8")
+            tpl_xml = tzf.read(xml_path)
+            writes = cell_writes.get(sheet_name, [])
+            if writes:
+                patched = _patch_sheet_xml(tpl_xml, writes)
+                logger.info(
+                    f"シートXMLパッチ: {sheet_name} "
+                    f"({len(writes)}セル書き込み)"
+                )
+            else:
+                patched = tpl_xml
+            patched_sheets[xml_path] = patched
 
-            # <extLst> ... </extLst> を抽出
-            start = raw.find("<extLst")
-            end = raw.find("</extLst>")
-            if start < 0 or end < 0:
-                continue
-            ext_xml = raw[start:end + len("</extLst>")]
+        # スキップ対象ファイル
+        SKIP_FILES = {"xl/calcChain.xml"}
 
-            # テンプレートの<worksheet>タグから名前空間宣言を抽出
-            ws_match = re.search(r"<worksheet\s([^>]+)>", raw)
-            extra_ns: list[str] = []
-            if ws_match:
-                attrs = ws_match.group(1)
-                # xmlns:xxx="..." と mc:Ignorable="..." を収集
-                for ns_match in re.finditer(
-                    r'(xmlns:\w+="[^"]*"|mc:Ignorable="[^"]*"|xr:uid="[^"]*")',
-                    attrs,
-                ):
-                    extra_ns.append(ns_match.group(1))
-
-            ext_data[xml_path] = (ext_xml, extra_ns)
-            logger.info(
-                f"拡張要素復元対象: {sheet_name} "
-                f"({len(ext_xml)}文字, ns={len(extra_ns)})"
-            )
-
-    if not ext_data:
-        return
-
-    # 出力ファイルに<extLst>と名前空間宣言を再注入
-    temp_path = output_path.with_suffix(".tmp2.xlsx")
-    with zipfile.ZipFile(str(output_path), "r") as ozf:
+        # 新しいZIPを構築
+        temp_path = output_path.with_suffix(".tmp.xlsx")
         with zipfile.ZipFile(
             str(temp_path), "w", zipfile.ZIP_DEFLATED,
         ) as nzf:
-            for item in ozf.infolist():
-                data = ozf.read(item.filename)
-                if item.filename in ext_data:
-                    text = data.decode("utf-8")
-                    ext_xml, extra_ns = ext_data[item.filename]
-
-                    if "<extLst" in text:
-                        # 既にextLstがあればスキップ
-                        nzf.writestr(item, data)
-                        continue
-
-                    # <worksheet ...> タグに名前空間宣言を追加
-                    for ns_decl in extra_ns:
-                        attr_name = ns_decl.split("=")[0]
-                        if attr_name not in text:
-                            text = text.replace(
-                                "<worksheet ",
-                                f"<worksheet {ns_decl} ",
-                                1,
-                            )
-
-                    # </worksheet> の直前に <extLst> を挿入
-                    close_tag = "</worksheet>"
-                    text = text.replace(
-                        close_tag, ext_xml + close_tag,
+            # 画像をdrawing XMLに挿入
+            modified_paths: set[str] = set()
+            sheet_rels_patches: dict[str, str] = {}
+            new_ct_overrides: list[str] = []
+            if image_placements:
+                modified_paths, sheet_rels_patches, new_ct_overrides = (
+                    _inject_images_into_zip(
+                        nzf, tzf, image_placements,
+                        sheet_drawing_map, tpl_sheet_map,
                     )
-                    data = text.encode("utf-8")
-                    logger.info(f"拡張要素復元完了: {item.filename}")
+                )
 
-                nzf.writestr(item, data)
+            written: set[str] = set(modified_paths)
+
+            for item in tzf.infolist():
+                fname = item.filename
+
+                if fname in SKIP_FILES:
+                    logger.debug(f"スキップ: {fname}")
+                    written.add(fname)
+                    continue
+
+                if fname in modified_paths:
+                    continue
+
+                if fname in patched_sheets:
+                    sheet_data = patched_sheets[fname]
+                    sheet_data = _add_drawing_ref_to_sheet(
+                        sheet_data, fname, sheet_rels_patches,
+                    )
+                    nzf.writestr(item, sheet_data)
+                elif fname in sheet_rels_patches:
+                    rels_data = tzf.read(fname).decode("utf-8")
+                    rels_data = _patch_sheet_rels(
+                        rels_data, sheet_rels_patches[fname],
+                    )
+                    nzf.writestr(item, rels_data.encode("utf-8"))
+                elif fname == "xl/workbook.xml":
+                    wb_data = _set_full_calc_on_load(tzf.read(fname))
+                    nzf.writestr(item, wb_data)
+                elif fname == "[Content_Types].xml":
+                    ct_text = tzf.read(fname).decode("utf-8")
+                    ct_text = re.sub(
+                        r'<Override[^>]*?PartName="[^"]*calcChain[^"]*"[^>]*/?>',
+                        "", ct_text,
+                    )
+                    if image_placements:
+                        ct_text = _ensure_content_types_for_images(ct_text)
+                    if new_ct_overrides:
+                        ct_close_pos = ct_text.rfind("</Types>")
+                        if ct_close_pos >= 0:
+                            ct_text = (
+                                ct_text[:ct_close_pos]
+                                + "".join(new_ct_overrides)
+                                + ct_text[ct_close_pos:]
+                            )
+                    nzf.writestr(item, ct_text.encode("utf-8"))
+                else:
+                    # 未パッチシートでもdrawing参照が必要な場合
+                    needs_drawing = False
+                    for sn, sp in tpl_sheet_map.items():
+                        if sp == fname:
+                            dir_p, file_p = posixpath.split(fname)
+                            rels_p = posixpath.join(
+                                dir_p, "_rels", file_p + ".rels"
+                            )
+                            if rels_p in sheet_rels_patches:
+                                needs_drawing = True
+                            break
+                    if needs_drawing:
+                        sdata = _add_drawing_ref_to_sheet(
+                            tzf.read(fname), fname,
+                            sheet_rels_patches,
+                        )
+                        nzf.writestr(item, sdata)
+                    else:
+                        nzf.writestr(item, tzf.read(fname))
+
+                written.add(fname)
+
+            # 新規シートrels（テンプレートに無い場合）
+            for rels_path, rel_xml in sheet_rels_patches.items():
+                if rels_path not in written:
+                    new_rels = (
+                        '<?xml version="1.0" encoding="UTF-8" '
+                        'standalone="yes"?>'
+                        '<Relationships xmlns='
+                        '"http://schemas.openxmlformats.org/package/'
+                        '2006/relationships">'
+                        f'{rel_xml}'
+                        '</Relationships>'
+                    )
+                    nzf.writestr(rels_path, new_rels.encode("utf-8"))
+                    written.add(rels_path)
 
     temp_path.replace(output_path)
+    logger.info(
+        f"テンプレートベース再構築完了: "
+        f"{len(patched_sheets)}シートパッチ, "
+        f"{len(image_placements or [])}画像挿入"
+    )
 
+
+# ─────────────────────────────────────────────────────────
+# メインクラス
+# ─────────────────────────────────────────────────────────
 
 class ExcelWriter:
     """見積テンプレートへの書き込みエンジン"""
@@ -420,76 +868,60 @@ class ExcelWriter:
 
         shutil.copy2(template_path, job.output_path)
 
-        # Excelファイルを開いて書き込み
+        # セル書き込み追跡用辞書
+        cell_tracker: dict[str, list[tuple[int, int, object]]] = {}
+
+        # openpyxlでセル書き込み追跡（結合セル検出のため）
         wb = openpyxl.load_workbook(job.output_path)
         sheet_names = _get_sheet_names(job.template_name)
 
         # ☆入力シートへの書き込み
         ws_input = wb[sheet_names["input"]]
-
-        # 書式設定を保存（openpyxlがsave時に壊す対策）
-        saved_input_fmt = _save_sheet_formatting(ws_input)
-
-        self._write_property_info(ws_input, job.survey.property_info)
-        self._write_fixture_rows(ws_input, job.matches)
-        self._write_excluded_rows(ws_input, job.survey.excluded_fixtures)
-
-        # 書式設定を復元（プルダウン・条件付き書式・オートフィルタ）
-        _restore_sheet_formatting(ws_input, saved_input_fmt)
+        self._write_property_info(ws_input, job.survey.property_info,
+                                  cell_tracker)
+        self._write_fixture_rows(ws_input, job.matches, cell_tracker)
+        self._write_excluded_rows(ws_input, job.survey.excluded_fixtures,
+                                  cell_tracker)
 
         # 選定シートへの書き込み
         ws_selection = wb[sheet_names["selection"]]
-        saved_selection_fmt = _save_sheet_formatting(ws_selection)
+        self._write_selection_sheet(ws_selection, job.matches, cell_tracker)
 
-        self._write_selection_sheet(ws_selection, job.matches)
-
-        _restore_sheet_formatting(ws_selection, saved_selection_fmt)
-
-        # 書き込み対象シート名を記録（ZIP復元時に除外するため）
+        # 書き込み対象シート名を記録
         modified_sheets = {
             sheet_names["input"],
             sheet_names["selection"],
         }
 
-        # 写真挿入（画像インデックスがある場合のみ）
-        if self.image_index:
-            # 選定シートにLED商品写真を挿入
-            self._write_selection_photos(ws_selection, job.matches)
-
-            # ⑩内訳シートにLED商品写真を挿入
-            breakdown_name = sheet_names.get("breakdown")
-            if breakdown_name and breakdown_name in wb.sheetnames:
-                ws_breakdown = wb[breakdown_name]
-                saved_bd_fmt = _save_sheet_formatting(ws_breakdown)
-                self._write_breakdown_photos(
-                    ws_breakdown, job.matches, job.survey,
-                )
-                _restore_sheet_formatting(ws_breakdown, saved_bd_fmt)
-                modified_sheets.add(breakdown_name)
-
-            # ⑪除外シートに除外器具写真を挿入
-            exclusion_name = sheet_names.get("exclusion")
-            if exclusion_name and exclusion_name in wb.sheetnames:
-                ws_exclusion = wb[exclusion_name]
-                saved_ex_fmt = _save_sheet_formatting(ws_exclusion)
-                self._write_exclusion_photos(
-                    ws_exclusion, job.survey.excluded_fixtures,
-                )
-                _restore_sheet_formatting(ws_exclusion, saved_ex_fmt)
-
-        wb.save(job.output_path)
         wb.close()
+        # openpyxlの保存結果は使わない（_rebuild_from_templateで破棄される）
 
-        # 未変更シート（①表紙～⑧見積書等）をテンプレートから復元
-        # openpyxlのload→saveで壊れたXMLを元に戻す
-        _restore_unmodified_sheets(
-            template_path, job.output_path, modified_sheets,
-        )
+        # 画像をImagePlacementとして収集
+        image_placements: list[ImagePlacement] = []
+        if self.image_index:
+            self._collect_selection_photos(
+                sheet_names["selection"], job.matches, image_placements,
+            )
 
-        # 変更シートの拡張要素（x14:dataValidations等）を復元
-        # openpyxlが非対応として削除するプルダウン等を再注入
-        _restore_sheet_extensions(
-            template_path, job.output_path, modified_sheets,
+            breakdown_name = sheet_names.get("breakdown")
+            if breakdown_name:
+                self._collect_breakdown_photos(
+                    breakdown_name, job.matches, job.survey,
+                    image_placements,
+                )
+
+            exclusion_name = sheet_names.get("exclusion")
+            if exclusion_name:
+                self._collect_exclusion_photos(
+                    exclusion_name, job.survey.excluded_fixtures,
+                    image_placements,
+                )
+
+        # テンプレートZIPベースで出力ファイルを完全再構築
+        _rebuild_from_template(
+            template_path, job.output_path,
+            modified_sheets, cell_tracker,
+            image_placements,
         )
 
         logger.info(f"見積ファイル出力完了: {job.output_path}")
@@ -502,124 +934,124 @@ class ExcelWriter:
                 return f
         return None
 
-    def _write_property_info(self, ws, info: PropertyInfo) -> None:
+    def _write_property_info(
+        self, ws, info: PropertyInfo,
+        tracker: dict[str, list[tuple[int, int, object]]],
+    ) -> None:
         """物件情報をヘッダーエリアに書き込み"""
-        # ☆入力シートのヘッダー部分
-        # A5:B5=ラベル結合, C5:F5=データ結合 の構造
         if info.name:
-            _safe_write(ws, 5, _col_to_idx("C"), info.name)
+            _safe_write(ws, 5, _col_to_idx("C"), info.name, tracker)
         if info.address:
-            _safe_write(ws, 6, _col_to_idx("C"), info.address)
+            _safe_write(ws, 6, _col_to_idx("C"), info.address, tracker)
         if info.unlock_code:
-            _safe_write(ws, 7, _col_to_idx("C"), info.unlock_code)
+            _safe_write(ws, 7, _col_to_idx("C"), info.unlock_code, tracker)
         if info.distribution_board:
-            _safe_write(ws, 8, _col_to_idx("C"), info.distribution_board)
+            _safe_write(ws, 8, _col_to_idx("C"), info.distribution_board,
+                        tracker)
         if info.special_notes:
-            _safe_write(ws, 9, _col_to_idx("C"), info.special_notes)
+            _safe_write(ws, 9, _col_to_idx("C"), info.special_notes, tracker)
 
         logger.info(f"物件情報書き込み: {info.name} / {info.address}")
 
-    def _write_fixture_rows(self, ws, matches: list[MatchResult]) -> None:
+    def _write_fixture_rows(
+        self, ws, matches: list[MatchResult],
+        tracker: dict[str, list[tuple[int, int, object]]],
+    ) -> None:
         """☆入力シートのデータ行（Row 16-45）に器具データを書き込み"""
         start_row = INPUT_SHEET["data_start_row"]  # 16
 
         for i, match in enumerate(matches):
-            if i >= 30:  # 最大30行（A-AD）
-                logger.warning("器具種別が30を超えました。超過分はスキップします。")
+            if i >= 30:
+                logger.warning(
+                    "器具種別が30を超えました。超過分はスキップします。"
+                )
                 break
 
             row = start_row + i
             fixture = match.fixture
 
-            # C列: 試算エリア（設置場所）
-            _safe_write(ws, row, _col_to_idx("C"), fixture.location)
-
-            # D列: 照明種別
-            _safe_write(ws, row, _col_to_idx("D"), fixture.fixture_type)
-
-            # E列: 現調備考
+            _safe_write(ws, row, _col_to_idx("C"), fixture.location, tracker)
+            _safe_write(ws, row, _col_to_idx("D"), fixture.fixture_type,
+                        tracker)
             if fixture.survey_notes:
-                _safe_write(ws, row, _col_to_idx("E"), fixture.survey_notes)
-
-            # F列: 工事備考
+                _safe_write(ws, row, _col_to_idx("E"), fixture.survey_notes,
+                            tracker)
             if fixture.construction_notes:
-                _safe_write(ws, row, _col_to_idx("F"), fixture.construction_notes)
-
-            # G列: 器具分類②（選定シートへのリンクキー）
+                _safe_write(ws, row, _col_to_idx("F"),
+                            fixture.construction_notes, tracker)
             if match.category_key:
-                _safe_write(ws, row, _col_to_idx("G"), match.category_key)
-
-            # I列: 一日点灯時間
+                _safe_write(ws, row, _col_to_idx("G"), match.category_key,
+                            tracker)
             if fixture.daily_hours > 0:
-                _safe_write(ws, row, _col_to_idx("I"), fixture.daily_hours)
-
-            # K列: 消費電力（安定器補正済み）
+                _safe_write(ws, row, _col_to_idx("I"), fixture.daily_hours,
+                            tracker)
             if fixture.adjusted_power_w > 0:
-                _safe_write(ws, row, _col_to_idx("K"), fixture.adjusted_power_w)
+                _safe_write(ws, row, _col_to_idx("K"),
+                            fixture.adjusted_power_w, tracker)
 
-            # L列: 電球数（合計）→ テンプレートに =SUM(M:V) 数式あり
-            # M-V列に各階数量を書き込めば自動計算されるため、L列には書き込まない
+            # L列: =SUM(M:V) 数式あり → 書き込まない
 
             # M-V列: 各階数量（1F〜10F）
-            floor_start_col = _col_to_idx("M")  # M=13
+            floor_start_col = _col_to_idx("M")
             for floor_idx, qty in enumerate(
                 fixture.quantities.to_list(10)
             ):
                 if qty > 0:
-                    _safe_write(ws, row, floor_start_col + floor_idx, qty)
+                    _safe_write(ws, row, floor_start_col + floor_idx, qty,
+                                tracker)
 
-            # AE列: 工事単価
             if match.construction_unit_price > 0:
                 _safe_write(ws, row, _col_to_idx("AE"),
-                            match.construction_unit_price)
+                            match.construction_unit_price, tracker)
 
         logger.info(f"器具データ {len(matches)}行を書き込みました")
 
-    def _write_excluded_rows(self, ws,
-                             excluded: list[ExistingFixture]) -> None:
+    def _write_excluded_rows(
+        self, ws, excluded: list[ExistingFixture],
+        tracker: dict[str, list[tuple[int, int, object]]],
+    ) -> None:
         """☆入力シートのLED済みセクション（Row 49+）に除外データを書き込み"""
         start_row = INPUT_SHEET["excluded_start_row"]  # 49
 
         for i, fixture in enumerate(excluded):
-            if i >= 10:  # 最大10行
+            if i >= 10:
                 break
 
             row = start_row + i
-
-            # C列: 試算エリア
-            _safe_write(ws, row, _col_to_idx("C"), fixture.location)
-
-            # D列: 照明種別
-            _safe_write(ws, row, _col_to_idx("D"), fixture.fixture_type)
-
-            # E列: 現調備考
+            _safe_write(ws, row, _col_to_idx("C"), fixture.location, tracker)
+            _safe_write(ws, row, _col_to_idx("D"), fixture.fixture_type,
+                        tracker)
             if fixture.survey_notes:
-                _safe_write(ws, row, _col_to_idx("E"), fixture.survey_notes)
+                _safe_write(ws, row, _col_to_idx("E"), fixture.survey_notes,
+                            tracker)
 
-            # L列: 電球数
-            if fixture.quantities.total > 0:
-                _safe_write(ws, row, _col_to_idx("L"),
-                            fixture.quantities.total)
+            # L列: =SUM(M:V) 数式あり → 直接書き込まない
+            # M-V列: 各階数量（1F〜10F）を書き込みL列は自動計算
+            floor_start_col = _col_to_idx("M")
+            for floor_idx, qty in enumerate(
+                fixture.quantities.to_list(10)
+            ):
+                if qty > 0:
+                    _safe_write(ws, row, floor_start_col + floor_idx, qty,
+                                tracker)
 
-            # W列: 除外理由
             if fixture.exclusion_reason:
                 _safe_write(ws, row, _col_to_idx("W"),
-                            fixture.exclusion_reason)
-
-            # AC列: アドバイス
+                            fixture.exclusion_reason, tracker)
             if fixture.exclusion_advice:
                 _safe_write(ws, row, _col_to_idx("AC"),
-                            fixture.exclusion_advice)
+                            fixture.exclusion_advice, tracker)
 
         if excluded:
             logger.info(f"除外データ {len(excluded)}行を書き込みました")
 
-    def _write_selection_sheet(self, ws,
-                               matches: list[MatchResult]) -> None:
+    def _write_selection_sheet(
+        self, ws, matches: list[MatchResult],
+        tracker: dict[str, list[tuple[int, int, object]]],
+    ) -> None:
         """選定シートにLED商品仕様を書き込み"""
         start_row = SELECTION_SHEET["data_start_row"]  # 3
 
-        # 同じcategory_keyのマッチを重複除去（選定シートは1カテゴリ1行）
         seen_keys: set[str] = set()
         unique_matches: list[MatchResult] = []
         for match in matches:
@@ -636,120 +1068,93 @@ class ExcelWriter:
             row = start_row + i
             led = match.led_product
 
-            # C列: リンクキー（☆入力!G列と一致させる）
-            _safe_write(ws, row, _col_to_idx("C"), match.category_key)
-
-            # D列: 照明色
-            _safe_write(ws, row, _col_to_idx("D"), led.lighting_color)
-
-            # E列: 器具色
-            _safe_write(ws, row, _col_to_idx("E"), led.fixture_color)
-
-            # F列: 器具サイズ
-            _safe_write(ws, row, _col_to_idx("F"), led.fixture_size)
-
-            # G列: 消費電力
+            _safe_write(ws, row, _col_to_idx("C"), match.category_key,
+                        tracker)
+            _safe_write(ws, row, _col_to_idx("D"), led.lighting_color,
+                        tracker)
+            _safe_write(ws, row, _col_to_idx("E"), led.fixture_color,
+                        tracker)
+            _safe_write(ws, row, _col_to_idx("F"), led.fixture_size,
+                        tracker)
             if led.power_w > 0:
-                _safe_write(ws, row, _col_to_idx("G"), led.power_w)
-
-            # H列: 全光束
-            _safe_write(ws, row, _col_to_idx("H"), led.lumens)
-
-            # I列: 合算定価
+                _safe_write(ws, row, _col_to_idx("G"), led.power_w, tracker)
+            _safe_write(ws, row, _col_to_idx("H"), led.lumens, tracker)
             if led.list_price_total > 0:
-                _safe_write(ws, row, _col_to_idx("I"), led.list_price_total)
-
-            # J列: 合算仕入
+                _safe_write(ws, row, _col_to_idx("I"), led.list_price_total,
+                            tracker)
             if led.purchase_price_total > 0:
                 _safe_write(ws, row, _col_to_idx("J"),
-                            led.purchase_price_total)
-
-            # K列: 防滴
+                            led.purchase_price_total, tracker)
             _safe_write(ws, row, _col_to_idx("K"),
-                        "〇" if led.is_waterproof else "✕")
-
-            # L列: 電球種別
-            _safe_write(ws, row, _col_to_idx("L"), led.bulb_type)
-
-            # M列: メーカー
-            _safe_write(ws, row, _col_to_idx("M"), led.manufacturer)
-
-            # N列: W相当
-            _safe_write(ws, row, _col_to_idx("N"), led.watt_equivalent)
-
-            # O列: 器具型番
-            _safe_write(ws, row, _col_to_idx("O"), led.model_number)
-
-            # P列: 定価
+                        "〇" if led.is_waterproof else "✕", tracker)
+            _safe_write(ws, row, _col_to_idx("L"), led.bulb_type, tracker)
+            _safe_write(ws, row, _col_to_idx("M"), led.manufacturer, tracker)
+            _safe_write(ws, row, _col_to_idx("N"), led.watt_equivalent,
+                        tracker)
+            _safe_write(ws, row, _col_to_idx("O"), led.model_number, tracker)
             if led.model_price > 0:
-                _safe_write(ws, row, _col_to_idx("P"), led.model_price)
-
-            # Q列: 仕入れ
+                _safe_write(ws, row, _col_to_idx("P"), led.model_price,
+                            tracker)
             if led.model_purchase > 0:
-                _safe_write(ws, row, _col_to_idx("Q"), led.model_purchase)
-
-            # R-Z列: 追加型番・価格
+                _safe_write(ws, row, _col_to_idx("Q"), led.model_purchase,
+                            tracker)
             if led.model_number_2:
-                _safe_write(ws, row, _col_to_idx("R"), led.model_number_2)
+                _safe_write(ws, row, _col_to_idx("R"), led.model_number_2,
+                            tracker)
             if led.model_price_2:
-                _safe_write(ws, row, _col_to_idx("S"), led.model_price_2)
+                _safe_write(ws, row, _col_to_idx("S"), led.model_price_2,
+                            tracker)
             if led.model_purchase_2:
-                _safe_write(ws, row, _col_to_idx("T"), led.model_purchase_2)
+                _safe_write(ws, row, _col_to_idx("T"), led.model_purchase_2,
+                            tracker)
             if led.model_number_3:
-                _safe_write(ws, row, _col_to_idx("U"), led.model_number_3)
+                _safe_write(ws, row, _col_to_idx("U"), led.model_number_3,
+                            tracker)
             if led.model_price_3:
-                _safe_write(ws, row, _col_to_idx("V"), led.model_price_3)
+                _safe_write(ws, row, _col_to_idx("V"), led.model_price_3,
+                            tracker)
             if led.model_purchase_3:
-                _safe_write(ws, row, _col_to_idx("W"), led.model_purchase_3)
+                _safe_write(ws, row, _col_to_idx("W"), led.model_purchase_3,
+                            tracker)
             if led.model_number_4:
-                _safe_write(ws, row, _col_to_idx("X"), led.model_number_4)
+                _safe_write(ws, row, _col_to_idx("X"), led.model_number_4,
+                            tracker)
             if led.model_price_4:
-                _safe_write(ws, row, _col_to_idx("Y"), led.model_price_4)
+                _safe_write(ws, row, _col_to_idx("Y"), led.model_price_4,
+                            tracker)
             if led.model_purchase_4:
-                _safe_write(ws, row, _col_to_idx("Z"), led.model_purchase_4)
-
-            # AA列: 消費電力（詳細）
+                _safe_write(ws, row, _col_to_idx("Z"), led.model_purchase_4,
+                            tracker)
             if led.power_detail > 0:
-                _safe_write(ws, row, _col_to_idx("AA"), led.power_detail)
-
-            # AB列: 全光束（詳細）
-            _safe_write(ws, row, _col_to_idx("AB"), led.lumens_detail)
-
-            # AC列: 器具素材
-            _safe_write(ws, row, _col_to_idx("AC"), led.material)
-
-            # AD列: 器具色選択肢
-            _safe_write(ws, row, _col_to_idx("AD"), led.color_options)
-
-            # AE列: 照明色選択肢
+                _safe_write(ws, row, _col_to_idx("AA"), led.power_detail,
+                            tracker)
+            _safe_write(ws, row, _col_to_idx("AB"), led.lumens_detail,
+                        tracker)
+            _safe_write(ws, row, _col_to_idx("AC"), led.material, tracker)
+            _safe_write(ws, row, _col_to_idx("AD"), led.color_options,
+                        tracker)
             _safe_write(ws, row, _col_to_idx("AE"),
-                        led.lighting_color_options)
-
-            # AF列: 定格寿命
-            _safe_write(ws, row, _col_to_idx("AF"), led.lifespan)
-
-            # AG列: 交換方法
-            _safe_write(ws, row, _col_to_idx("AG"), led.replacement_method)
-
-            # AH列: 口金
-            _safe_write(ws, row, _col_to_idx("AH"), led.socket)
+                        led.lighting_color_options, tracker)
+            _safe_write(ws, row, _col_to_idx("AF"), led.lifespan, tracker)
+            _safe_write(ws, row, _col_to_idx("AG"), led.replacement_method,
+                        tracker)
+            _safe_write(ws, row, _col_to_idx("AH"), led.socket, tracker)
 
         logger.info(
             f"選定データ {len(unique_matches)}カテゴリを書き込みました"
         )
 
-    # ===== 写真挿入メソッド =====
+    # ===== 写真収集メソッド（ZIPレベル挿入用） =====
 
-    def _write_selection_photos(
-        self, ws, matches: list[MatchResult],
+    def _collect_selection_photos(
+        self,
+        sheet_name: str,
+        matches: list[MatchResult],
+        placements: list[ImagePlacement],
     ) -> None:
-        """選定シートにLED商品写真を挿入
-
-        A列=写真①、B列=写真② (各行は1カテゴリ)
-        """
+        """選定シートのLED商品写真をImagePlacementとして収集"""
         start_row = SELECTION_SHEET["data_start_row"]  # 3
 
-        # 重複除去（選定シートは1カテゴリ1行）
         seen_keys: set[str] = set()
         unique_matches: list[MatchResult] = []
         for match in matches:
@@ -757,16 +1162,16 @@ class ExcelWriter:
                 seen_keys.add(match.category_key)
                 unique_matches.append(match)
 
-        photo_count = 0
+        count = 0
         for i, match in enumerate(unique_matches):
             if i >= 30:
                 break
             if match.led_product is None:
                 continue
 
-            row = start_row + i
+            row_0based = start_row + i - 1  # 0-based
 
-            # 写真①（A列）
+            # 写真① (A列, col=0)
             img1_data = self.image_index.get_product_image(
                 match.led_product, photo_num=1,
             )
@@ -775,15 +1180,19 @@ class ExcelWriter:
                     resized = resize_for_cell(
                         img1_data, SELECTION_PHOTO1_W, SELECTION_PHOTO_H,
                     )
-                    insert_image_to_cell(
-                        ws, resized, row, 1,  # A=1
-                        SELECTION_PHOTO1_W, SELECTION_PHOTO_H,
-                    )
-                    photo_count += 1
+                    placements.append(ImagePlacement(
+                        sheet_name=sheet_name,
+                        image_data=resized,
+                        row=row_0based,
+                        col=0,  # A列
+                        width_px=SELECTION_PHOTO1_W,
+                        height_px=SELECTION_PHOTO_H,
+                    ))
+                    count += 1
                 except Exception as e:
-                    logger.warning(f"選定写真①挿入エラー (row={row}): {e}")
+                    logger.warning(f"選定写真①収集エラー (row={start_row+i}): {e}")
 
-            # 写真②（B列）
+            # 写真② (B列, col=1)
             img2_data = self.image_index.get_product_image(
                 match.led_product, photo_num=2,
             )
@@ -792,39 +1201,42 @@ class ExcelWriter:
                     resized = resize_for_cell(
                         img2_data, SELECTION_PHOTO2_W, SELECTION_PHOTO_H,
                     )
-                    insert_image_to_cell(
-                        ws, resized, row, 2,  # B=2
-                        SELECTION_PHOTO2_W, SELECTION_PHOTO_H,
-                    )
-                    photo_count += 1
+                    placements.append(ImagePlacement(
+                        sheet_name=sheet_name,
+                        image_data=resized,
+                        row=row_0based,
+                        col=1,  # B列
+                        width_px=SELECTION_PHOTO2_W,
+                        height_px=SELECTION_PHOTO_H,
+                    ))
+                    count += 1
                 except Exception as e:
-                    logger.warning(f"選定写真②挿入エラー (row={row}): {e}")
+                    logger.warning(f"選定写真②収集エラー (row={start_row+i}): {e}")
 
-        logger.info(f"選定シート写真挿入: {photo_count}枚")
+        logger.info(f"選定シート写真収集: {count}枚")
 
-    def _write_breakdown_photos(
-        self, ws, matches: list[MatchResult],
+    def _collect_breakdown_photos(
+        self,
+        sheet_name: str,
+        matches: list[MatchResult],
         survey: SurveyData,
+        placements: list[ImagePlacement],
     ) -> None:
-        """⑩内訳シートに既存器具写真とLED商品写真を挿入
-
-        Row 7: 既存器具写真（現調写真）→ B-U列
-        Row 14: LED商品写真（ラインナップ表から）→ B-U列
-        各列はRow 16-35（☆入力の器具行A-T）に対応
-        """
+        """⑩内訳シートの写真をImagePlacementとして収集"""
         existing_row = BREAKDOWN_SHEET["existing_photo_row"]  # 7
-        led_row = BREAKDOWN_SHEET["led_photo_row"]            # 14
-        photo_w = BREAKDOWN_PHOTO_W                           # 100
-        photo_h = BREAKDOWN_PHOTO_H                           # 90
+        led_row = BREAKDOWN_SHEET["led_photo_row"]  # 14
+        photo_w = BREAKDOWN_PHOTO_W
+        photo_h = BREAKDOWN_PHOTO_H
 
-        photo_count = 0
+        count = 0
         for i, match in enumerate(matches):
-            if i >= 20:  # B-U列 = 最大20列
+            if i >= 20:
                 break
 
-            col = _col_to_idx("B") + i  # B=2, C=3, ...
+            col_1based = _col_to_idx("B") + i
+            col_0based = col_1based - 1
 
-            # Row 7: 既存器具写真（現調写真を中央トリミング→照明アップ）
+            # 既存器具写真
             fixture = match.fixture
             if fixture.photo_paths:
                 photo_path = fixture.photo_paths[0]
@@ -833,17 +1245,21 @@ class ExcelWriter:
                         resized = prepare_fixture_photo(
                             photo_path, photo_w, photo_h,
                         )
-                        insert_image_to_cell(
-                            ws, resized, existing_row, col,
-                            photo_w, photo_h,
-                        )
-                        photo_count += 1
+                        placements.append(ImagePlacement(
+                            sheet_name=sheet_name,
+                            image_data=resized,
+                            row=existing_row - 1,  # 0-based
+                            col=col_0based,
+                            width_px=photo_w,
+                            height_px=photo_h,
+                        ))
+                        count += 1
                     except Exception as e:
                         logger.warning(
-                            f"内訳 既存写真挿入エラー (col={col}): {e}"
+                            f"内訳 既存写真収集エラー (col={col_1based}): {e}"
                         )
 
-            # Row 14: LED商品写真（ラインナップ表から）
+            # LED商品写真
             if match.led_product:
                 img_data = self.image_index.get_product_image(
                     match.led_product, photo_num=1,
@@ -853,39 +1269,42 @@ class ExcelWriter:
                         resized = resize_for_cell(
                             img_data, photo_w, photo_h,
                         )
-                        insert_image_to_cell(
-                            ws, resized, led_row, col,
-                            photo_w, photo_h,
-                        )
-                        photo_count += 1
+                        placements.append(ImagePlacement(
+                            sheet_name=sheet_name,
+                            image_data=resized,
+                            row=led_row - 1,  # 0-based
+                            col=col_0based,
+                            width_px=photo_w,
+                            height_px=photo_h,
+                        ))
+                        count += 1
                     except Exception as e:
                         logger.warning(
-                            f"内訳 LED写真挿入エラー (col={col}): {e}"
+                            f"内訳 LED写真収集エラー (col={col_1based}): {e}"
                         )
 
-        logger.info(f"⑩内訳シート写真挿入: {photo_count}枚")
+        logger.info(f"⑩内訳シート写真収集: {count}枚")
 
-    def _write_exclusion_photos(
-        self, ws, excluded: list[ExistingFixture],
+    def _collect_exclusion_photos(
+        self,
+        sheet_name: str,
+        excluded: list[ExistingFixture],
+        placements: list[ImagePlacement],
     ) -> None:
-        """⑪除外シートに除外器具の現調写真を挿入
-
-        12ブロック: 左6(B列, Row 4/8/12/16/20/24) + 右6(I列)
-        """
+        """⑪除外シートの写真をImagePlacementとして収集"""
         blocks = EXCLUSION_SHEET["blocks"]
-        photo_w = EXCLUSION_PHOTO_W  # 78
-        photo_h = EXCLUSION_PHOTO_H  # 80
+        photo_w = EXCLUSION_PHOTO_W
+        photo_h = EXCLUSION_PHOTO_H
 
-        photo_count = 0
+        count = 0
         for i, fixture in enumerate(excluded):
             if i >= len(blocks):
                 break
 
             block = blocks[i]
-            col = _col_to_idx(block["photo_col"])
-            row = block["photo_row"]
+            col_1based = _col_to_idx(block["photo_col"])
+            row_1based = block["photo_row"]
 
-            # 除外器具の現調写真（中央トリミング+高画質）
             if fixture.photo_paths:
                 photo_path = fixture.photo_paths[0]
                 if photo_path.exists():
@@ -893,15 +1312,19 @@ class ExcelWriter:
                         resized = prepare_fixture_photo(
                             photo_path, photo_w, photo_h,
                         )
-                        insert_image_to_cell(
-                            ws, resized, row, col,
-                            photo_w, photo_h,
-                        )
-                        photo_count += 1
+                        placements.append(ImagePlacement(
+                            sheet_name=sheet_name,
+                            image_data=resized,
+                            row=row_1based - 1,  # 0-based
+                            col=col_1based - 1,  # 0-based
+                            width_px=photo_w,
+                            height_px=photo_h,
+                        ))
+                        count += 1
                     except Exception as e:
                         logger.warning(
-                            f"除外写真挿入エラー (block={i}): {e}"
+                            f"除外写真収集エラー (block={i}): {e}"
                         )
 
-        if photo_count > 0:
-            logger.info(f"⑪除外シート写真挿入: {photo_count}枚")
+        if count > 0:
+            logger.info(f"⑪除外シート写真収集: {count}枚")

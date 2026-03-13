@@ -106,6 +106,7 @@ def run_pipeline(
     output_path: Optional[Path] = None,
     checksheet_indices: Optional[list[int]] = None,
     api_key: Optional[str] = None,
+    property_name: Optional[str] = None,
 ) -> Path:
     """現調フォルダからLED見積Excelを生成
 
@@ -287,8 +288,11 @@ def run_pipeline(
     logger.info("Step 4: OCR結果パース")
     survey = parse_survey_ocr(ocr_result, fixture_photos=photo_map)
 
-    # 物件名はフォルダ名（SFA管理名）を優先
-    survey.property_info.name = survey_dir.name
+    # 物件名: 引数 > OCR結果 > フォルダ名の優先順
+    if property_name:
+        survey.property_info.name = property_name
+    elif not survey.property_info.name:
+        survey.property_info.name = survey_dir.name
 
     # 建物外観写真をセット
     if building_photos:
