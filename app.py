@@ -37,6 +37,7 @@ except Exception:
 LINEUP_DIR = ROOT_DIR / "ラインナップ表"
 TEMPLATE_DIR = ROOT_DIR / "見積りテンプレート"
 OUTPUT_DIR = ROOT_DIR / "output"
+CONFIG_DIR = ROOT_DIR / "config"
 
 # テンプレート一覧
 TEMPLATES = [
@@ -52,6 +53,21 @@ TEMPLATES = [
     "ライフサポート",
     "高知ハウス",
 ]
+
+
+# ============================================================
+# 管理会社ルール読み込み
+# ============================================================
+@st.cache_data
+def load_management_company_rules():
+    """config/management_company_rules.json から管理会社ルールを読み込む"""
+    rules_path = CONFIG_DIR / "management_company_rules.json"
+    if not rules_path.exists():
+        return {}
+    with open(rules_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    # name → ルール辞書のマッピング
+    return {c["name"]: c for c in data.get("companies", [])}
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}
 PDF_EXTENSIONS = {".pdf"}
@@ -217,7 +233,6 @@ def process_photo_route(photo_dir, property_name, template_name, status):
     result_path = run_pipeline(
         survey_dir=photo_dir, lineup_dir=LINEUP_DIR,
         template_dir=TEMPLATE_DIR, template_name=template_name,
-        property_name=property_name,
     )
     return result_path
 
@@ -229,8 +244,34 @@ def process_photo_route(photo_dir, property_name, template_name, status):
 def tab_estimate():
     """見積作成タブ"""
 
-    # --- テンプレート選択 ---
-    template_name = st.selectbox("テンプレート", TEMPLATES)
+    # --- 管理会社ルール読み込み ---
+    company_rules = load_management_company_rules()
+    company_names = ["（指定なし）"] + sorted(company_rules.keys())
+
+    # --- 管理会社選択 ---
+    selected_company = st.selectbox("管理会社", company_names)
+    rule = company_rules.get(selected_company)
+
+    # --- テンプレート選択（管理会社選択時は自動設定） ---
+    if rule:
+        auto_template = rule.get("テンプレート", "田村基本形")
+        template_idx = TEMPLATES.index(auto_template) if auto_template in TEMPLATES else 0
+        template_name = st.selectbox("テンプレート", TEMPLATES, index=template_idx)
+    else:
+        template_name = st.selectbox("テンプレート", TEMPLATES)
+
+    # --- 管理会社ルール表示 ---
+    if rule:
+        cols = st.columns(5)
+        cols[0].metric("表紙", rule.get("表紙", "—"))
+        cols[1].metric("紹介料", f"{rule['紹介料']}%" if rule.get("紹介料") else "なし")
+        cols[2].metric("交換費", f"{rule['交換費']:,}円" if rule.get("交換費") is not None else "—")
+        cols[3].metric("幹旋料", f"{rule['幹旋料']}%" if rule.get("幹旋料") else "なし")
+        cols[4].metric("電気単価", f"{rule['電気単価']}円" if rule.get("電気単価") else "—")
+        if rule.get("共有方法"):
+            st.caption(f"共有方法: {rule['共有方法']} / データ形式: {rule.get('共有データ', '—')}")
+        if rule.get("備考"):
+            st.warning(f"注意: {rule['備考']}")
 
     # --- 物件情報 ---
     col1, col2 = st.columns(2)
