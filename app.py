@@ -439,300 +439,238 @@ def tab_estimate():
                     type="primary", use_container_width=True,
                 )
 
-                st.caption("この結果はフィードバックタブで自動的に使用できます。")
-
             except Exception as e:
                 st.error(f"エラー: {e}")
                 import traceback
                 st.code(traceback.format_exc())
 
+    # --- インラインフィードバック ---
+    _show_inline_feedback()
+
 
 # ============================================================
-# タブ2: フィードバック
+# インラインフィードバック（見積作成画面の下部）
 # ============================================================
 
-def tab_feedback():
-    """フィードバックタブ — AI出力 vs 修正済みExcelを比較"""
+def _show_inline_feedback():
+    """見積作成後のインラインフィードバック機能"""
 
-    st.markdown(
-        "修正済みExcelをアップロードすると、"
-        "AI生成結果とセルレベルで自動比較し差分レポートを作成します。"
-    )
-
-    st.divider()
-
-    # --- AI生成Excel（システム保持） ---
     history = st.session_state.get("ai_excel_history", [])
+    if not history:
+        return
 
-    ai_excel_bytes = None
-    ai_excel_name = None
+    st.divider()
 
-    if history:
-        st.markdown("**AI生成Excel（自動保持）**")
-        # 選択肢を作成
-        options = [
-            f"{h['property_name']} - {h['name']}（{h['timestamp']}）"
-            for h in history
-        ]
-        selected_idx = st.selectbox(
-            "比較対象のAI生成結果を選択",
-            range(len(options)),
-            format_func=lambda i: options[i],
-            key="fb_ai_select",
+    with st.expander("修正フィードバック（AI精度改善に協力する）"):
+        st.caption(
+            "修正済みExcelをアップロードすると、AI生成結果と自動比較して改善に役立てます。"
         )
-        ai_excel_bytes = history[selected_idx]["bytes"]
-        ai_excel_name = history[selected_idx]["name"]
-        st.caption(f"\u2705 {ai_excel_name} を使用")
-    else:
-        st.markdown("**AI生成Excel（元）**")
-        st.info("まだ見積を作成していません。見積作成タブで作成するか、手動でアップロードしてください。")
-        ai_file_manual = st.file_uploader(
-            "AI出力ファイル（手動アップロード）",
+
+        # AI生成Excel選択
+        if len(history) == 1:
+            ai_excel_bytes = history[0]["bytes"]
+            ai_excel_name = history[0]["name"]
+            st.caption(f"比較対象: {history[0]['property_name']} - {ai_excel_name}")
+        else:
+            options = [
+                f"{h['property_name']} - {h['name']}（{h['timestamp']}）"
+                for h in history
+            ]
+            selected_idx = st.selectbox(
+                "比較対象のAI生成結果",
+                range(len(options)),
+                format_func=lambda i: options[i],
+                key="fb_ai_select",
+            )
+            ai_excel_bytes = history[selected_idx]["bytes"]
+            ai_excel_name = history[selected_idx]["name"]
+
+        # 修正済みExcelアップロード
+        correct_file = st.file_uploader(
+            "修正済みExcel",
             type=["xlsx"],
-            key="fb_ai_file_manual",
+            key="fb_correct_file",
         )
-        if ai_file_manual:
-            ai_excel_bytes = ai_file_manual.getbuffer()
-            ai_excel_name = ai_file_manual.name
 
-    st.divider()
+        if not correct_file:
+            return
 
-    # --- 修正済みExcel ---
-    st.markdown("**修正済みExcel（正）**")
-    correct_file = st.file_uploader(
-        "人間が修正したファイル",
-        type=["xlsx"],
-        key="fb_correct_file",
-    )
+        # コメント入力
+        col_c1, col_c2 = st.columns(2)
+        with col_c1:
+            comment_reading = st.text_area(
+                "読み取りコメント（任意）",
+                height=80,
+                placeholder="例: 3階の逆富士が40wではなく20wだった",
+                key="fb_comment_reading",
+            )
+        with col_c2:
+            comment_selection = st.text_area(
+                "LED選定コメント（任意）",
+                height=80,
+                placeholder="例: FHF32はmyシリーズが適切",
+                key="fb_comment_selection",
+            )
 
-    st.divider()
+        # 比較実行
+        if st.button("比較実行", key="fb_compare", use_container_width=True):
+            with tempfile.TemporaryDirectory() as tmpdir:
+                tmpdir = Path(tmpdir)
 
-    # --- コメント入力（2カテゴリ） ---
-    st.markdown("**コメント（任意）**")
+                ai_path = tmpdir / (ai_excel_name or "ai_output.xlsx")
+                ai_path.write_bytes(ai_excel_bytes)
+                correct_path = tmpdir / correct_file.name
+                correct_path.write_bytes(correct_file.getbuffer())
 
-    comment_reading = st.text_area(
-        "① 現調情報の読み取りについて",
-        height=80,
-        placeholder="例: 3階の逆富士が40wではなく20wだった。非常灯の数量が1台多くカウントされていた。",
-        key="fb_comment_reading",
-    )
-
-    comment_selection = st.text_area(
-        "② LED選定について",
-        height=80,
-        placeholder="例: FHF32はiDシリーズではなくmyシリーズが適切。非常灯は一体型を選定すべき。",
-        key="fb_comment_selection",
-    )
-
-    # --- バリデーション ---
-    can_compare = bool(ai_excel_bytes and correct_file)
-    if not can_compare:
-        if ai_excel_bytes and not correct_file:
-            st.info("修正済みExcelをアップロードしてください")
-        elif not ai_excel_bytes:
-            st.info("AI生成Excelがありません。見積作成タブで作成してください")
-
-    # --- 比較実行 ---
-    if st.button("比較実行", type="primary", disabled=not can_compare, use_container_width=True):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            tmpdir = Path(tmpdir)
-
-            # ファイル保存
-            ai_path = tmpdir / (ai_excel_name or "ai_output.xlsx")
-            ai_path.write_bytes(ai_excel_bytes)
-            correct_path = tmpdir / correct_file.name
-            correct_path.write_bytes(correct_file.getbuffer())
-
-            try:
-                with st.status("比較中...", expanded=True) as status:
-                    from feedback_comparator import FeedbackComparator
-                    comparator = FeedbackComparator()
-                    report = comparator.compare(ai_path, correct_path)
-                    status.update(label="比較完了", state="complete")
-
-                # --- サマリー表示 ---
-                st.subheader("比較結果")
-
-                # メトリクス
-                m1, m2, m3 = st.columns(3)
-                m1.metric("差分セル数", report.total_diffs)
-                m2.metric("器具行一致率", f"{report.fixture_match_rate:.0%}")
-                m3.metric("LED選定一致率", f"{report.led_selection_match_rate:.0%}")
-
-                m4, m5, m6 = st.columns(3)
-                m4.metric("器具数（AI / 正解）",
-                          f"{report.total_fixtures_ai} / {report.total_fixtures_correct}")
-                m5.metric("除外数（AI / 正解）",
-                          f"{report.total_excluded_ai} / {report.total_excluded_correct}")
-                m6.metric("商品数（AI / 正解）",
-                          f"{report.total_products_ai} / {report.total_products_correct}")
-
-                # --- ヘッダー差分 ---
-                if report.header_diffs:
-                    with st.expander(f"ヘッダー差分（{len(report.header_diffs)}件）", expanded=True):
-                        for d in report.header_diffs:
-                            severity_icon = {"critical": "\U0001f534", "major": "\U0001f7e0", "minor": "\U0001f7e2"}.get(d.severity, "\u2b1c")
-                            st.markdown(f"{severity_icon} **{d.field_name}** ({d.cell})")
-                            c1, c2 = st.columns(2)
-                            c1.code(f"AI: {d.ai_value}", language=None)
-                            c2.code(f"正解: {d.correct_value}", language=None)
-
-                # --- 器具行差分 ---
-                fixture_issues = [fd for fd in report.fixture_diffs if fd.status != "match"]
-                if fixture_issues:
-                    with st.expander(f"器具行の差分（{len(fixture_issues)}件）", expanded=True):
-                        for fd in fixture_issues:
-                            status_label = {
-                                "modified": "\u270f\ufe0f 修正",
-                                "missing_in_ai": "\u2795 AI欠落",
-                                "extra_in_ai": "\u2796 AI余分",
-                            }.get(fd.status, fd.status)
-                            st.markdown(f"**行{fd.row_label}** ({status_label})")
-                            if fd.fixture_type_ai != fd.fixture_type_correct:
-                                st.markdown(f"  器具: `{fd.fixture_type_ai}` \u2192 `{fd.fixture_type_correct}`")
-                            for d in fd.diffs:
-                                severity_icon = {"critical": "\U0001f534", "major": "\U0001f7e0", "minor": "\U0001f7e2"}.get(d.severity, "\u2b1c")
-                                st.markdown(f"  {severity_icon} {d.field_name}: `{d.ai_value}` \u2192 `{d.correct_value}`")
-                            st.markdown("---")
-
-                # --- 選定シート差分 ---
-                selection_issues = [sd for sd in report.selection_diffs if sd.status != "match"]
-                if selection_issues:
-                    with st.expander(f"選定シートの差分（{len(selection_issues)}件）"):
-                        for sd in selection_issues:
-                            st.markdown(f"**行{sd.row_number}**")
-                            for d in sd.diffs:
-                                st.markdown(f"  {d.field_name}: `{d.ai_value}` \u2192 `{d.correct_value}`")
-
-                # 差分なしの場合
-                if report.total_diffs == 0:
-                    st.success("差分なし！AI出力と修正済みは完全一致です。")
-
-                st.divider()
-
-                # --- フィードバックJSON生成・ダウンロード ---
-                report_dict = {
-                    "ai_file": report.ai_file,
-                    "correct_file": report.correct_file,
-                    "timestamp": datetime.now().isoformat(),
-                    "property_name": report.property_name,
-                    "comment": {
-                        "reading": comment_reading,
-                        "selection": comment_selection,
-                    },
-                    "summary": {
-                        "total_diffs": report.total_diffs,
-                        "fixture_match_rate": round(report.fixture_match_rate, 3),
-                        "led_selection_match_rate": round(report.led_selection_match_rate, 3),
-                        "fixtures": {
-                            "ai": report.total_fixtures_ai,
-                            "correct": report.total_fixtures_correct,
-                        },
-                        "excluded": {
-                            "ai": report.total_excluded_ai,
-                            "correct": report.total_excluded_correct,
-                        },
-                        "products": {
-                            "ai": report.total_products_ai,
-                            "correct": report.total_products_correct,
-                        },
-                    },
-                    "header_diffs": [
-                        {"cell": d.cell, "field": d.field_name, "severity": d.severity,
-                         "ai": d.ai_value, "correct": d.correct_value}
-                        for d in report.header_diffs
-                    ],
-                    "fixture_diffs": [
-                        {
-                            "row": fd.row_label, "status": fd.status,
-                            "type_ai": fd.fixture_type_ai, "type_correct": fd.fixture_type_correct,
-                            "diffs": [
-                                {"field": d.field_name, "severity": d.severity,
-                                 "ai": d.ai_value, "correct": d.correct_value}
-                                for d in fd.diffs
-                            ],
-                        }
-                        for fd in report.fixture_diffs if fd.status != "match"
-                    ],
-                    "selection_diffs": [
-                        {
-                            "row": sd.row_number, "status": sd.status,
-                            "diffs": [
-                                {"field": d.field_name, "ai": d.ai_value, "correct": d.correct_value}
-                                for d in sd.diffs
-                            ],
-                        }
-                        for sd in report.selection_diffs if sd.status != "match"
-                    ],
-                }
-
-                feedback_json = json.dumps(report_dict, ensure_ascii=False, indent=2)
-                timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
-                prop_name = report.property_name or "unknown"
-                filename = f"feedback_{prop_name}_{timestamp_str}.json"
-
-                # --- フィードバック送信（Google Sheets） ---
-                _sheets_available = False
-                _sheets_error = ""
                 try:
-                    from feedback_store import FeedbackStore
-                    _store = FeedbackStore.from_streamlit_secrets()
-                    _sheets_available = True
-                except KeyError:
-                    _sheets_error = "Streamlit secrets に [feedback] gas_webapp_url が未設定です"
-                except Exception as e:
-                    _sheets_error = f"フィードバック接続エラー: {e}"
+                    with st.status("比較中...", expanded=True) as status:
+                        from feedback_comparator import FeedbackComparator
+                        comparator = FeedbackComparator()
+                        report = comparator.compare(ai_path, correct_path)
+                        status.update(label="比較完了", state="complete")
 
-                if _sheets_error:
-                    st.warning(f"Google Sheets 連携が無効です: {_sheets_error}")
+                    # メトリクス
+                    m1, m2, m3 = st.columns(3)
+                    m1.metric("差分セル数", report.total_diffs)
+                    m2.metric("器具行一致率", f"{report.fixture_match_rate:.0%}")
+                    m3.metric("LED選定一致率", f"{report.led_selection_match_rate:.0%}")
 
-                if _sheets_available:
-                    if st.button("フィードバック送信",
-                                 type="primary", use_container_width=True):
-                        try:
-                            fid = _store.submit_feedback(
-                                report_dict=report_dict,
-                                comment_reading=comment_reading,
-                                comment_selection=comment_selection,
-                            )
-                            st.success(f"フィードバック送信完了 (ID: {fid})")
-                        except Exception as e:
-                            st.error(f"送信エラー: {e}")
+                    # ヘッダー差分
+                    if report.header_diffs:
+                        with st.expander(f"ヘッダー差分（{len(report.header_diffs)}件）", expanded=True):
+                            for d in report.header_diffs:
+                                severity_icon = {"critical": "\U0001f534", "major": "\U0001f7e0", "minor": "\U0001f7e2"}.get(d.severity, "\u2b1c")
+                                st.markdown(f"{severity_icon} **{d.field_name}** ({d.cell})")
+                                c1, c2 = st.columns(2)
+                                c1.code(f"AI: {d.ai_value}", language=None)
+                                c2.code(f"正解: {d.correct_value}", language=None)
 
-                    # 累計統計
-                    try:
-                        stats = _store.get_feedback_stats()
-                        if stats.get("total_feedback"):
-                            st.caption(
-                                f"累計フィードバック: {stats['total_feedback']}件 / "
-                                f"LED選定平均一致率: {stats['avg_led_match_rate']:.0%}"
-                            )
-                    except Exception:
-                        pass
+                    # 器具行差分
+                    fixture_issues = [fd for fd in report.fixture_diffs if fd.status != "match"]
+                    if fixture_issues:
+                        with st.expander(f"器具行の差分（{len(fixture_issues)}件）", expanded=True):
+                            for fd in fixture_issues:
+                                status_label = {
+                                    "modified": "\u270f\ufe0f 修正",
+                                    "missing_in_ai": "\u2795 AI欠落",
+                                    "extra_in_ai": "\u2796 AI余分",
+                                }.get(fd.status, fd.status)
+                                st.markdown(f"**行{fd.row_label}** ({status_label})")
+                                if fd.fixture_type_ai != fd.fixture_type_correct:
+                                    st.markdown(f"  器具: `{fd.fixture_type_ai}` \u2192 `{fd.fixture_type_correct}`")
+                                for d in fd.diffs:
+                                    severity_icon = {"critical": "\U0001f534", "major": "\U0001f7e0", "minor": "\U0001f7e2"}.get(d.severity, "\u2b1c")
+                                    st.markdown(f"  {severity_icon} {d.field_name}: `{d.ai_value}` \u2192 `{d.correct_value}`")
+                                st.markdown("---")
+
+                    # 選定シート差分
+                    selection_issues = [sd for sd in report.selection_diffs if sd.status != "match"]
+                    if selection_issues:
+                        with st.expander(f"選定シートの差分（{len(selection_issues)}件）"):
+                            for sd in selection_issues:
+                                st.markdown(f"**行{sd.row_number}**")
+                                for d in sd.diffs:
+                                    st.markdown(f"  {d.field_name}: `{d.ai_value}` \u2192 `{d.correct_value}`")
+
+                    if report.total_diffs == 0:
+                        st.success("差分なし！AI出力と修正済みは完全一致です。")
 
                     st.divider()
 
-                # --- JSON ダウンロード（バックアップ） ---
-                st.download_button(
-                    label="フィードバックJSONダウンロード",
-                    data=feedback_json,
-                    file_name=filename,
-                    mime="application/json",
-                    use_container_width=True,
-                )
+                    # フィードバック送信
+                    report_dict = {
+                        "ai_file": report.ai_file,
+                        "correct_file": report.correct_file,
+                        "timestamp": datetime.now().isoformat(),
+                        "property_name": report.property_name,
+                        "comment": {
+                            "reading": comment_reading,
+                            "selection": comment_selection,
+                        },
+                        "summary": {
+                            "total_diffs": report.total_diffs,
+                            "fixture_match_rate": round(report.fixture_match_rate, 3),
+                            "led_selection_match_rate": round(report.led_selection_match_rate, 3),
+                            "fixtures": {"ai": report.total_fixtures_ai, "correct": report.total_fixtures_correct},
+                            "excluded": {"ai": report.total_excluded_ai, "correct": report.total_excluded_correct},
+                            "products": {"ai": report.total_products_ai, "correct": report.total_products_correct},
+                        },
+                        "header_diffs": [
+                            {"cell": d.cell, "field": d.field_name, "severity": d.severity,
+                             "ai": d.ai_value, "correct": d.correct_value}
+                            for d in report.header_diffs
+                        ],
+                        "fixture_diffs": [
+                            {"row": fd.row_label, "status": fd.status,
+                             "type_ai": fd.fixture_type_ai, "type_correct": fd.fixture_type_correct,
+                             "diffs": [{"field": d.field_name, "severity": d.severity,
+                                        "ai": d.ai_value, "correct": d.correct_value} for d in fd.diffs]}
+                            for fd in report.fixture_diffs if fd.status != "match"
+                        ],
+                        "selection_diffs": [
+                            {"row": sd.row_number, "status": sd.status,
+                             "diffs": [{"field": d.field_name, "ai": d.ai_value, "correct": d.correct_value}
+                                       for d in sd.diffs]}
+                            for sd in report.selection_diffs if sd.status != "match"
+                        ],
+                    }
 
-                if _sheets_available:
-                    st.caption("送信済みデータは日次で自動的にシステム改善に反映されます。")
-                else:
-                    st.caption(
-                        "ダウンロードしたJSONを保管しておくと、"
-                        "蓄積データからAIロジックの改善に活用できます。"
+                    feedback_json = json.dumps(report_dict, ensure_ascii=False, indent=2)
+                    timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    prop_name = report.property_name or "unknown"
+                    filename = f"feedback_{prop_name}_{timestamp_str}.json"
+
+                    # Google Sheets送信
+                    _sheets_available = False
+                    _sheets_error = ""
+                    try:
+                        from feedback_store import FeedbackStore
+                        _store = FeedbackStore.from_streamlit_secrets()
+                        _sheets_available = True
+                    except KeyError:
+                        _sheets_error = "Streamlit secrets に [feedback] gas_webapp_url が未設定です"
+                    except Exception as e:
+                        _sheets_error = f"フィードバック接続エラー: {e}"
+
+                    if _sheets_error:
+                        st.warning(f"Google Sheets 連携が無効です: {_sheets_error}")
+
+                    if _sheets_available:
+                        if st.button("フィードバック送信", key="fb_submit",
+                                     type="primary", use_container_width=True):
+                            try:
+                                fid = _store.submit_feedback(
+                                    report_dict=report_dict,
+                                    comment_reading=comment_reading,
+                                    comment_selection=comment_selection,
+                                )
+                                st.success(f"フィードバック送信完了 (ID: {fid})")
+                            except Exception as e:
+                                st.error(f"送信エラー: {e}")
+
+                        try:
+                            stats = _store.get_feedback_stats()
+                            if stats.get("total_feedback"):
+                                st.caption(
+                                    f"累計: {stats['total_feedback']}件 / "
+                                    f"LED選定平均一致率: {stats['avg_led_match_rate']:.0%}"
+                                )
+                        except Exception:
+                            pass
+
+                    st.download_button(
+                        label="フィードバックJSONダウンロード",
+                        data=feedback_json,
+                        file_name=filename,
+                        mime="application/json",
+                        use_container_width=True,
+                        key="fb_json_dl",
                     )
 
-            except Exception as e:
-                st.error(f"比較エラー: {e}")
-                import traceback
-                st.code(traceback.format_exc())
+                except Exception as e:
+                    st.error(f"比較エラー: {e}")
+                    import traceback
+                    st.code(traceback.format_exc())
 
 
 # ============================================================
@@ -744,13 +682,7 @@ def main():
     init_session()
     st.title("LED見積シミュレーション作成")
 
-    tab1, tab2 = st.tabs(["\U0001f4cb 見積作成", "\U0001f4dd フィードバック"])
-
-    with tab1:
-        tab_estimate()
-
-    with tab2:
-        tab_feedback()
+    tab_estimate()
 
 
 if __name__ == "__main__":
