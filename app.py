@@ -136,9 +136,10 @@ def extract_zips_and_files(files: list[Path], dest_dir: Path) -> tuple[list[Path
 
 def extract_text_from_file_ai(file_path: Path) -> str:
     """画像やPDFからAI（Claude Vision）でテキスト情報を抽出"""
-    import anthropic
+    sys.path.insert(0, str(Path(__file__).parent.parent))
+    from claude_guard import get_guarded_client
 
-    client = anthropic.Anthropic()
+    client = get_guarded_client()
     suffix = file_path.suffix.lower()
     file_bytes = file_path.read_bytes()
     b64_data = base64.standard_b64encode(file_bytes).decode("utf-8")
@@ -672,12 +673,18 @@ def tab_feedback():
 
                 # --- フィードバック送信（Google Sheets） ---
                 _sheets_available = False
+                _sheets_error = ""
                 try:
                     from feedback_store import FeedbackStore
                     _store = FeedbackStore.from_streamlit_secrets()
                     _sheets_available = True
-                except Exception:
-                    pass
+                except KeyError:
+                    _sheets_error = "Streamlit secrets に [feedback] gas_webapp_url が未設定です"
+                except Exception as e:
+                    _sheets_error = f"フィードバック接続エラー: {e}"
+
+                if _sheets_error:
+                    st.warning(f"Google Sheets 連携が無効です: {_sheets_error}")
 
                 if _sheets_available:
                     if st.button("フィードバック送信",

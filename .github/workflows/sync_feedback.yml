@@ -35,6 +35,10 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add feedback/
-          git diff --cached --quiet || git commit -m "フィードバック同期: ルール自動更新 ($(date +%Y-%m-%d))"
-          git push
+          if [ -d feedback/ ]; then
+            git add feedback/
+            git diff --cached --quiet || git commit -m "フィードバック同期: ルール自動更新 ($(date +%Y-%m-%d))"
+            git push
+          else
+            echo "feedback/ ディレクトリなし — スキップ"
+          fi
