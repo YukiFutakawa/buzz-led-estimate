@@ -597,6 +597,11 @@ def _show_inline_feedback():
                     import traceback
                     st.code(traceback.format_exc())
 
+        # --- 送信完了メッセージ ---
+        if "fb_submitted_id" in st.session_state:
+            st.success(f"フィードバック送信完了しました (ID: {st.session_state['fb_submitted_id']})")
+            del st.session_state["fb_submitted_id"]
+
         # --- 比較結果表示 & 送信（session_stateから読み出し） ---
         if "fb_report_display" in st.session_state:
             disp = st.session_state["fb_report_display"]
@@ -677,8 +682,8 @@ def _show_inline_feedback():
                             comment_reading=report_dict.get("comment", {}).get("reading", ""),
                             comment_selection=report_dict.get("comment", {}).get("selection", ""),
                         )
-                        st.success(f"フィードバック送信完了 (ID: {fid})")
-                        # 送信後にクリア
+                        # 送信成功フラグを保存してから比較結果をクリア
+                        st.session_state["fb_submitted_id"] = fid
                         del st.session_state["fb_report_dict"]
                         del st.session_state["fb_report_display"]
                         st.rerun()
