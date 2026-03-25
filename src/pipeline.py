@@ -422,7 +422,7 @@ def _load_feedback_rules() -> list[dict]:
     try:
         rules = json.loads(rules_path.read_text(encoding="utf-8"))
         if rules:
-            applicable = [r for r in rules if r.get("count", 0) >= 2]
+            applicable = [r for r in rules if r.get("count", 0) >= 1]
             logger.info(
                 f"フィードバックルール読み込み: {len(rules)}件 "
                 f"(適用対象: {len(applicable)}件)"

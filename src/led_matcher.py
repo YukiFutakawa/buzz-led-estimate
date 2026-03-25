@@ -679,7 +679,7 @@ class LEDMatcher:
     ) -> Optional[MatchResult]:
         """フィードバック学習ルールによるLED選定の上書き
 
-        過去のフィードバックで修正実績が2回以上あるルールに合致する場合、
+        過去のフィードバックで修正実績が1回以上あるルールに合致する場合、
         通常の選定ロジックをスキップしてルール指定の製品を返す。
         """
         if not self._feedback_rules:
@@ -691,7 +691,7 @@ class LEDMatcher:
 
         for rule in self._feedback_rules:
             count = rule.get("count", 0)
-            if count < 2:
+            if count < 1:
                 continue
 
             rule_ft = _normalize(rule.get("fixture_type", "")).lower()

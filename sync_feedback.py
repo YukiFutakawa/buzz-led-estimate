@@ -88,8 +88,8 @@ def main():
 
         # ルール数を表示
         rules = json.loads(rules_path.read_text(encoding="utf-8"))
-        applicable = [r for r in rules if r.get("count", 0) >= 2]
-        print(f"  総ルール数: {len(rules)} / 適用対象(count>=2): {len(applicable)}")
+        applicable = [r for r in rules if r.get("count", 0) >= 1]
+        print(f"  総ルール数: {len(rules)} / 適用対象(count>=1): {len(applicable)}")
 
     # 5. 同期済みフラグを更新
     store.mark_synced(saved_ids)
