@@ -157,7 +157,7 @@ class FeedbackAccumulator:
                 key = (diff["field_name"], diff["ai_value"],
                        diff["correct_value"])
                 pattern_map[key]["count"] += 1
-                pattern_map[key]["severity"] = diff["severity"]
+                pattern_map[key]["severity"] = diff.get("severity", "unknown")
                 pattern_map[key]["files"].append(source)
 
             # 器具行差分
@@ -168,7 +168,7 @@ class FeedbackAccumulator:
                     key = (diff["field_name"], diff["ai_value"],
                            diff["correct_value"])
                     pattern_map[key]["count"] += 1
-                    pattern_map[key]["severity"] = diff["severity"]
+                    pattern_map[key]["severity"] = diff.get("severity", "unknown")
                     pattern_map[key]["fixtures"].append(ft)
                     pattern_map[key]["files"].append(source)
 
@@ -178,7 +178,7 @@ class FeedbackAccumulator:
                     key = (diff["field_name"], diff["ai_value"],
                            diff["correct_value"])
                     pattern_map[key]["count"] += 1
-                    pattern_map[key]["severity"] = diff["severity"]
+                    pattern_map[key]["severity"] = diff.get("severity", "unknown")
                     pattern_map[key]["files"].append(source)
 
         self.error_patterns = []
