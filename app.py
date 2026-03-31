@@ -234,6 +234,7 @@ def process_photo_route(photo_dir, property_name, template_name, status):
     result_path = run_pipeline(
         survey_dir=photo_dir, lineup_dir=LINEUP_DIR,
         template_dir=TEMPLATE_DIR, template_name=template_name,
+        property_name=property_name,
     )
     return result_path
 

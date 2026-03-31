@@ -27,7 +27,7 @@ def get_scan_file_tab_js() -> str:
     Returns:
         JavaScript code (window._sfaFileList にファイル情報を設定)
     """
-    return """
+    return r"""
 (function() {
     var files = [];
     // ファイルタブのファイル一覧を走査

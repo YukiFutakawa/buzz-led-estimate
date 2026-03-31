@@ -398,10 +398,13 @@ def run_ai_anomaly_check(
         .replace("{checklist_data}", checklist_data)
     )
 
-    # API呼び出し（テキストのみ）
+    # API呼び出し（テキストのみ）— claude_guard 経由
     try:
-        import anthropic
-        client = anthropic.Anthropic(api_key=api_key)
+        import sys
+        from pathlib import Path
+        sys.path.insert(0, str(Path(__file__).parent.parent.parent))
+        from claude_guard import get_guarded_client
+        client = get_guarded_client(api_key=api_key)
         message = client.messages.create(
             model="claude-sonnet-4-6",
             max_tokens=2048,

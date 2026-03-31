@@ -213,10 +213,13 @@ class HistoryTextParser:
     def _get_client(self):
         if self._client is None:
             try:
-                import anthropic
-                self._client = anthropic.Anthropic(api_key=self.api_key)
+                import sys
+                from pathlib import Path
+                sys.path.insert(0, str(Path(__file__).parent.parent.parent))
+                from claude_guard import get_guarded_client
+                self._client = get_guarded_client(api_key=self.api_key)
             except ImportError:
-                raise RuntimeError("anthropic パッケージが必要です: pip install anthropic")
+                raise RuntimeError("anthropic または claude_guard が必要です")
         return self._client
 
     def parse(

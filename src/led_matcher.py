@@ -1784,12 +1784,17 @@ class LEDMatcher:
 
         # 交換方法から基本単価を決定
         method = product.replacement_method or ""
+        ft_norm = _normalize(fixture.fixture_type or "")
+        is_downlight = any(
+            kw in ft_norm for kw in ("ダウンライト", "DL")
+        )
         if "ランプ" in method or "球" in method:
             base = prices.get("ランプ交換", 1500)
         elif "バイパス" in method:
             base = prices.get("バイパス工事", 5000)
-        elif cls.is_recessed:
-            # 蛍光灯埋込タイプは5000円（2026/02/26〜）
+        elif cls.is_recessed and not is_downlight:
+            # 蛍光灯埋込タイプは5000円（全ネジボルト作業等）
+            # ※ダウンライトは埋込だが器具交換扱い(3000円)
             base = prices.get("埋込器具交換", 5000)
         else:
             base = prices.get("器具交換", 3000)

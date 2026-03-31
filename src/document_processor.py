@@ -103,14 +103,17 @@ class DocumentProcessor:
             )
 
     def _init_client(self, api_key: str) -> None:
-        """Anthropic クライアントを初期化"""
+        """Anthropic クライアントを初期化（claude_guard 経由）"""
         try:
-            import anthropic
-            self._client = anthropic.Anthropic(api_key=api_key)
-            logger.info(f"Anthropic API 初期化完了 (model={self.model})")
+            import sys
+            from pathlib import Path
+            sys.path.insert(0, str(Path(__file__).parent.parent.parent))
+            from claude_guard import get_guarded_client
+            self._client = get_guarded_client(api_key=api_key)
+            logger.info(f"Anthropic API 初期化完了 (model={self.model}) [claude_guard]")
         except ImportError:
             logger.error(
-                "anthropic パッケージがインストールされていません。"
+                "anthropic または claude_guard が見つかりません。"
                 "pip install anthropic を実行してください。"
             )
         except Exception as e:

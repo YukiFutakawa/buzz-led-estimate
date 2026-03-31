@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3:*)",
+      "Bash(ls -1 *.xlsx)",
+      "Bash(cat:*)",
+      "Bash(python toshiba_price_update.py)",
+      "Bash(ls -lh *.xlsx)",
+      "Bash(python mitsubishi_price_update.py)"
+    ]
+  }
+}
