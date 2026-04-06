@@ -1,0 +1,38 @@
+[
+  {
+    "fixture_type": "非常灯兼用2灯式20形蛍光灯",
+    "wrong_selection": "LED一体形ｼｰﾘﾝｸﾞﾗｲﾄ〈天井-N/W/100w〉",
+    "correct_selection": "非常灯一体型20形ﾍﾞｰｽﾗｲﾄ〈2灯/W230-N/防雨・防湿/M〉",
+    "count": 1
+  },
+  {
+    "fixture_type": "階段灯",
+    "wrong_selection": "LED一体形ﾀﾞｳﾝﾗｲﾄ〈Φ100‐L/W/100w/T〉",
+    "correct_selection": "非常用階段灯20形〈W127/N/M〉",
+    "count": 1
+  },
+  {
+    "fixture_type": "ブラケット",
+    "wrong_selection": "LED一体形ｼｰﾘﾝｸﾞﾗｲﾄ〈天井-N/W/100w〉",
+    "correct_selection": "天井・壁面ﾌﾞﾗｹｯﾄ〈Φ265/L/K/60w〉",
+    "count": 1
+  },
+  {
+    "fixture_type": "非常灯付きシーリング",
+    "wrong_selection": "LED一体形ﾀﾞｳﾝﾗｲﾄ〈Φ100‐L/W/60w/T〉",
+    "correct_selection": "非常用丸形ﾌﾞﾗｹｯﾄ〈Φ380-L〉ﾘﾆｭｰｱﾙ",
+    "count": 1
+  },
+  {
+    "fixture_type": "20形1灯用",
+    "wrong_selection": "20形 屋外ブラケット 〈W126/N/T〉",
+    "correct_selection": "20形ﾄﾗﾌﾗｲﾄ〈W70-N/防雨・防湿/M〉",
+    "count": 1
+  },
+  {
+    "fixture_type": "ポール灯",
+    "wrong_selection": "支柱灯・ﾎﾟｰﾁﾗｲﾄ〈Φ160/L/W/60W〉",
+    "correct_selection": "Tランプ〈E26/60/N/ﾊﾞｲﾊﾟｽ〉＋口金ソケット(E26)交換",
+    "count": 1
+  }
+]

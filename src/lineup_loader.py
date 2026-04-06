@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import logging
+import pickle
+import hashlib
 from pathlib import Path
 from typing import Optional
 
@@ -193,8 +195,18 @@ class LineupIndex:
         self.by_sheet: dict[str, list[LEDProduct]] = {}
         self.by_manufacturer: dict[str, list[LEDProduct]] = {}
 
+    # キャッシュファイルのバージョン（LEDProductの構造変更時にインクリメント）
+    _CACHE_VERSION = 1
+
     def load_all(self, lineup_dir: Path) -> None:
-        """ラインナップ表ディレクトリから全ファイルを読み込み"""
+        """ラインナップ表ディレクトリから全ファイルを読み込み（キャッシュ対応）"""
+        cache_path = lineup_dir / ".lineup_cache.pickle"
+
+        # キャッシュが有効ならそこから読み込み（高速）
+        if self._load_from_cache(cache_path, lineup_dir):
+            return
+
+        # Excelから読み込み（初回 or キャッシュ無効時）
         for file_enum, sheets in LINEUP_SHEETS.items():
             filepath = lineup_dir / file_enum
             if not filepath.exists():
@@ -208,6 +220,71 @@ class LineupIndex:
             f"ラインナップ読み込み完了: {len(self.products)}商品, "
             f"{len(self.by_sheet)}カテゴリ"
         )
+
+        # キャッシュに保存（次回高速化）
+        self._save_to_cache(cache_path, lineup_dir)
+
+    def _get_files_fingerprint(self, lineup_dir: Path) -> str:
+        """ラインナップファイルの更新日時からフィンガープリントを生成"""
+        parts = []
+        for file_enum in LINEUP_SHEETS:
+            filepath = lineup_dir / file_enum
+            if filepath.exists():
+                stat = filepath.stat()
+                parts.append(f"{file_enum}:{stat.st_mtime}:{stat.st_size}")
+        return hashlib.md5("|".join(parts).encode()).hexdigest()
+
+    def _load_from_cache(self, cache_path: Path, lineup_dir: Path) -> bool:
+        """キャッシュファイルからデータを復元。成功したらTrueを返す"""
+        if not cache_path.exists():
+            return False
+
+        try:
+            with open(cache_path, "rb") as f:
+                cache_data = pickle.load(f)
+
+            # バージョンチェック
+            if cache_data.get("version") != self._CACHE_VERSION:
+                logger.info("キャッシュバージョン不一致 → 再読み込み")
+                return False
+
+            # ファイル更新チェック
+            if cache_data.get("fingerprint") != self._get_files_fingerprint(lineup_dir):
+                logger.info("ラインナップファイル更新検出 → 再読み込み")
+                return False
+
+            self.products = cache_data["products"]
+            self.by_sheet = cache_data["by_sheet"]
+            self.by_manufacturer = cache_data["by_manufacturer"]
+
+            logger.info(
+                f"キャッシュから読み込み: {len(self.products)}商品, "
+                f"{len(self.by_sheet)}カテゴリ"
+            )
+            return True
+
+        except Exception as e:
+            logger.warning(f"キャッシュ読み込み失敗（再生成します）: {e}")
+            return False
+
+    def _save_to_cache(self, cache_path: Path, lineup_dir: Path) -> None:
+        """読み込んだデータをキャッシュファイルに保存"""
+        try:
+            cache_data = {
+                "version": self._CACHE_VERSION,
+                "fingerprint": self._get_files_fingerprint(lineup_dir),
+                "products": self.products,
+                "by_sheet": self.by_sheet,
+                "by_manufacturer": self.by_manufacturer,
+            }
+            # 一時ファイルに書き込み後リネーム（破損防止）
+            tmp_path = cache_path.with_suffix(".tmp")
+            with open(tmp_path, "wb") as f:
+                pickle.dump(cache_data, f, protocol=pickle.HIGHEST_PROTOCOL)
+            tmp_path.replace(cache_path)
+            logger.info(f"キャッシュ保存完了: {cache_path.name}")
+        except Exception as e:
+            logger.warning(f"キャッシュ保存失敗（動作に影響なし）: {e}")
 
     def _load_file(self, filepath: Path, file_name: str,
                    target_sheets: list[str]) -> None:

@@ -2,19 +2,18 @@
 
 現調資料フォルダから見積Excelを自動生成する統合モジュール。
 
-フロー:
-  1. 現調フォルダ内の写真を収集
-  1.5 AI画像分類（チェックシート / 器具写真 / 建物外観を自動判定）
-  2. チェックシートをOCR → 構造化データ
-  3. 器具写真をAIで行ラベルに自動紐付け → photo_paths
-  4. LED選定
-  5. Excel出力（写真付き）
+3ステップフロー（UI用）:
+  Step 1: run_step1_ocr()        → チェックシートOCR + テキスト入力 → パース
+  Step 2: run_step2_photo_suggest() → AI写真マッチング推定
+  Step 3a: run_step3_preview()    → LED選定プレビュー
+  Step 3b: run_step3_generate()   → LED選定 → Excel出力
 """
 
 from __future__ import annotations
 
 import json
 import logging
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
@@ -98,234 +97,218 @@ def separate_checksheet_and_photos(
     return checksheets, fixture_photos
 
 
-def run_pipeline(
-    survey_dir: Path,
-    lineup_dir: Path,
-    template_dir: Path,
-    template_name: str = "田村基本形",
-    output_path: Optional[Path] = None,
-    checksheet_indices: Optional[list[int]] = None,
+# ============================================================
+# 3ステップ分割API（UI用）
+# ============================================================
+
+@dataclass
+class Step1Result:
+    """Step 1（OCR + パース）の結果。UIで編集してStep 2/3に渡す。"""
+
+    # OCR結果（生データ）— UI編集フォームの初期値に使う
+    ocr_result: dict = field(default_factory=dict)
+
+    # パース済みデータ — 編集後に確定版として使う
+    survey: "SurveyData" = None  # type: ignore[assignment]
+
+    # 画像情報
+    all_images: list[Path] = field(default_factory=list)
+    checksheet_paths: list[Path] = field(default_factory=list)
+
+
+def run_step1_ocr(
+    survey_dir: Optional[Path] = None,
     api_key: Optional[str] = None,
     property_name: Optional[str] = None,
-) -> Path:
-    """現調フォルダからLED見積Excelを生成
+    text_input: Optional[str] = None,
+) -> Step1Result:
+    """Step 1: チェックシートOCR + テキスト入力 → パース
+
+    アップロードされたファイルは全てチェックシートとして扱う。
+    テキスト入力がある場合はOCRスキップしてテキストからパースのみ行う。
+    両方ある場合はOCR結果とテキストを結合してパースする。
 
     Args:
-        survey_dir: 現調資料フォルダ（写真が入ったフォルダ）
-        lineup_dir: ラインナップ表フォルダ
-        template_dir: 見積テンプレートフォルダ
-        template_name: テンプレート名
-        output_path: 出力パス（省略時は自動生成）
-        checksheet_indices: チェックシートのインデックス。
-            指定時は従来の手動方式。省略(None)時はAI自動分類。
-        api_key: Anthropic APIキー（省略時は環境変数）
+        survey_dir: 現調資料フォルダ（画像がある場合）
+        api_key: Anthropic APIキー
+        property_name: 物件名（省略時はフォルダ名）
+        text_input: テキスト入力（手入力の器具情報など）
 
     Returns:
-        出力Excelファイルパス
+        Step1Result: OCR結果・パース済みSurveyData
     """
     from document_processor import DocumentProcessor
-    from survey_parser import parse_survey_ocr, match_photos_to_fixtures
-    from lineup_loader import LineupIndex
-    from image_handler import LineupImageIndex
-    from led_matcher import LEDMatcher
-    from excel_writer import ExcelWriter
-    from models import QuotationJob, MatchResult
+    from survey_parser import parse_survey_ocr
 
-    # --- Step 1: 画像の収集 ---
-    logger.info("=" * 50)
-    logger.info("Step 1: 画像の収集")
-    all_images = find_survey_images(survey_dir)
-    if not all_images:
-        raise FileNotFoundError(f"画像が見つかりません: {survey_dir}")
-    logger.info(f"発見した画像: {len(all_images)}枚")
+    result = Step1Result()
+    ocr_text = ""
 
-    # DocumentProcessorの初期化（AI分類・OCRの両方で使用）
-    processor = DocumentProcessor(api_key=api_key)
+    # --- 画像からOCR ---
+    if survey_dir is not None:
+        logger.info("Step 1: 画像の収集")
+        all_images = find_survey_images(survey_dir)
+        if not all_images and text_input is None:
+            raise FileNotFoundError(f"画像が見つかりません: {survey_dir}")
+        result.all_images = all_images
+        logger.info(f"発見した画像: {len(all_images)}枚")
 
-    # --- Step 1.5: 画像の分類 ---
-    building_photos = []
+        if all_images:
+            # アップされたファイルは全てチェックシートとして扱う
+            result.checksheet_paths = list(all_images)
 
-    if checksheet_indices is not None:
-        # 従来方式: インデックス指定による手動分類
-        logger.info("Step 1.5: 画像の分類（手動指定モード）")
-        checksheets, fixture_photos = separate_checksheet_and_photos(
-            all_images, checksheet_indices,
-        )
-    else:
-        # AI自動分類モード
-        logger.info("Step 1.5: 画像の分類（AI自動分類モード）")
-        try:
-            classification = processor.classify_images(all_images)
-
-            checksheets = [
-                all_images[c["index"]]
-                for c in classification
-                if c["type"] == "checksheet"
-            ]
-            fixture_photos = [
-                all_images[c["index"]]
-                for c in classification
-                if c["type"] == "fixture"
-            ]
-            building_photos = [
-                all_images[c["index"]]
-                for c in classification
-                if c["type"] == "building"
-            ]
-
-            if not checksheets:
-                # チェックシートなし → 写真直接解析モードに切替
-                logger.info(
-                    "チェックシートなし → 写真直接解析モードに切替"
-                )
-                if len(all_images) <= 4:
-                    raise ValueError(
-                        f"写真が{len(all_images)}枚しかありません。"
-                        "自動処理には5枚以上必要です。"
-                    )
-                direct_result = processor.analyze_fixtures_from_photos(
-                    all_images,
-                    property_name=survey_dir.name,
-                )
-                # 写真マッピングを構築
-                photo_map = {}
-                for fix in direct_result.get("fixtures", []):
-                    label = fix.get("row_label", "")
-                    indices = fix.get("photo_indices", [])
-                    if label and indices:
-                        photo_map[label] = [
-                            all_images[i]
-                            for i in indices
-                            if i < len(all_images)
-                        ]
-                # 建物外観写真
-                b_indices = direct_result.get(
-                    "building_photo_indices", []
-                )
-                building_photos = [
-                    all_images[i]
-                    for i in b_indices
-                    if i < len(all_images)
-                ]
-                # Step 4: パース（OCR/写真紐付けをスキップ）
-                survey = parse_survey_ocr(
-                    direct_result, fixture_photos=photo_map,
-                )
-                # 物件名はフォルダ名（SFA管理名）を優先
-                survey.property_info.name = survey_dir.name
-                if building_photos:
-                    survey.building_photo_path = building_photos[0]
-                # Step 5以降に合流（LED選定へジャンプ）
-                return run_from_survey_data(
-                    survey=survey,
-                    lineup_dir=lineup_dir,
-                    template_dir=template_dir,
-                    template_name=template_name,
-                    output_path=output_path,
-                )
-
-            logger.info(
-                f"AI分類結果: チェックシート={len(checksheets)}枚, "
-                f"器具写真={len(fixture_photos)}枚, "
-                f"建物写真={len(building_photos)}枚"
+            processor = DocumentProcessor(api_key=api_key)
+            logger.info("Step 1: チェックシートOCR")
+            result.ocr_result = processor.ocr_survey_sheets(
+                [str(p) for p in result.checksheet_paths],
             )
+            ocr_text = result.ocr_result.get("raw_text", "")
 
-        except Exception as e:
-            # AI分類失敗時のフォールバック
-            if "API" in str(e) or "初期化" in str(e):
-                logger.warning(
-                    f"AI分類に失敗しました: {e}\n"
-                    "従来方式（1枚目=チェックシート）にフォールバックします。"
-                )
-                checksheets, fixture_photos = separate_checksheet_and_photos(
-                    all_images, [0],
-                )
-            else:
-                raise
-
-    # --- Step 2: OCR ---
-    logger.info("Step 2: チェックシートOCR")
-    ocr_result = processor.ocr_survey_sheets(
-        [str(p) for p in checksheets],
-    )
-
-    # --- Step 3: 写真紐付け ---
-    logger.info("Step 3: 器具写真の紐付け")
-
-    if checksheet_indices is not None:
-        # 従来方式: ファイル名パターン or 順番で紐付け
-        photo_dir = fixture_photos[0].parent if fixture_photos else survey_dir
-        photo_map = match_photos_to_fixtures(
-            photo_dir,
-            exclude_paths=checksheets,
-        )
+    # --- テキスト入力の処理 ---
+    if text_input and ocr_text:
+        # 両方ある場合: OCR結果とテキストを結合
+        logger.info("Step 1: OCR結果とテキスト入力を結合してパース")
+        combined_text = ocr_text + "\n" + text_input
+        result.ocr_result["raw_text"] = combined_text
+        survey = parse_survey_ocr(result.ocr_result, fixture_photos={})
+    elif text_input:
+        # テキストのみ: OCRスキップ
+        logger.info("Step 1: テキスト入力からパース（OCRスキップ）")
+        result.ocr_result = {"raw_text": text_input}
+        survey = parse_survey_ocr(result.ocr_result, fixture_photos={})
     else:
-        # AI自動マッチングモード
-        if fixture_photos and ocr_result.get("fixtures"):
-            try:
-                photo_map = processor.match_photos_to_rows(
-                    fixture_photos,
-                    ocr_result.get("fixtures", []),
-                )
-            except Exception as e:
-                logger.warning(
-                    f"AI写真マッチングに失敗: {e}\n"
-                    "従来方式にフォールバックします。"
-                )
-                photo_dir = (
-                    fixture_photos[0].parent
-                    if fixture_photos
-                    else survey_dir
-                )
-                photo_map = match_photos_to_fixtures(
-                    photo_dir,
-                    exclude_paths=checksheets,
-                )
-        else:
-            photo_map = {}
+        # OCRのみ
+        logger.info("Step 1: OCR結果パース")
+        survey = parse_survey_ocr(result.ocr_result, fixture_photos={})
 
-    # --- Step 4: パース ---
-    logger.info("Step 4: OCR結果パース")
-    survey = parse_survey_ocr(ocr_result, fixture_photos=photo_map)
-
-    # 物件名: 引数 > OCR結果 > フォルダ名の優先順
+    # 物件名の設定
     if property_name:
         survey.property_info.name = property_name
-    elif not survey.property_info.name:
+    elif survey_dir and not survey.property_info.name:
         survey.property_info.name = survey_dir.name
 
-    # 建物外観写真をセット
-    if building_photos:
-        survey.building_photo_path = building_photos[0]
-
-    # --- Step 5〜8: 共通処理 ---
-    return run_from_survey_data(
-        survey=survey,
-        lineup_dir=lineup_dir,
-        template_dir=template_dir,
-        template_name=template_name,
-        output_path=output_path,
-    )
+    result.survey = survey
+    return result
 
 
-def run_from_survey_data(
-    survey,
+def run_step2_photo_suggest(
+    fixture_photos: list[Path],
+    ocr_fixtures: list[dict],
+    api_key: Optional[str] = None,
+) -> list[dict]:
+    """Step 2: AI写真マッチング推定（デフォルト選択用）
+
+    器具写真をOCR結果の器具行にAIが自動マッチングする。
+    結果はあくまで「推定」で、UIでユーザーが修正する前提。
+
+    Args:
+        fixture_photos: 器具写真パスのリスト
+        ocr_fixtures: OCR結果のfixtures配列（row_label, location等を含む）
+        api_key: Anthropic APIキー
+
+    Returns:
+        AIの推定結果リスト。各要素:
+        {
+            "photo_index": int,      # fixture_photos内のインデックス
+            "photo_path": str,       # 写真ファイルパス
+            "row_label": str,        # 推定された行ラベル（"A"〜"T"）
+            "confidence": str,       # "high" / "medium" / "low"
+            "reason": str,           # 推定理由
+        }
+    """
+    from document_processor import DocumentProcessor
+
+    if not fixture_photos or not ocr_fixtures:
+        return []
+
+    processor = DocumentProcessor(api_key=api_key)
+
+    try:
+        # AIマッチング実行
+        photo_map = processor.match_photos_to_rows(
+            fixture_photos, ocr_fixtures,
+        )
+        # photo_mapは {row_label: [Path, ...]} 形式
+        # UIで使いやすい形式に変換
+        suggestions = []
+        for label, paths in photo_map.items():
+            for path in paths:
+                idx = None
+                for i, fp in enumerate(fixture_photos):
+                    if fp == path or str(fp) == str(path):
+                        idx = i
+                        break
+                suggestions.append({
+                    "photo_index": idx,
+                    "photo_path": str(path),
+                    "row_label": label,
+                    "confidence": "medium",  # 個別信頼度は元APIにない
+                    "reason": "AI自動推定",
+                })
+        return suggestions
+
+    except Exception as e:
+        logger.warning(f"AI写真マッチングに失敗: {e}")
+        return []
+
+
+def run_step3_preview(
+    fixtures: list,
+    lineup_dir: Path,
+) -> tuple:
+    """Step 3a: LED選定プレビュー
+
+    各器具に対してAI選定結果と代替候補リストを返す。
+    ユーザーが結果を確認・変更してからExcel生成に進むためのステップ。
+
+    Returns:
+        (matches, candidates_map)
+        - matches: list[MatchResult] — 各器具のAI選定結果
+        - candidates_map: dict[str, list[LEDProduct]] — {行ラベル: 候補リスト}
+    """
+    from lineup_loader import LineupIndex
+    from led_matcher import LEDMatcher
+
+    logger.info("Step 3a: LED選定プレビュー")
+    lineup_idx = LineupIndex()
+    lineup_idx.load_all(lineup_dir)
+
+    feedback_rules = _load_feedback_rules()
+    matcher = LEDMatcher(lineup_idx, feedback_rules=feedback_rules)
+    matches = matcher.match_all(fixtures)
+
+    # 各器具の代替候補を取得
+    candidates_map = {}
+    for fixture in fixtures:
+        if fixture.is_excluded:
+            continue
+        candidates = matcher.get_top_candidates(fixture, max_count=5)
+        candidates_map[fixture.row_label] = candidates
+
+    logger.info(f"プレビュー完了: {len(matches)}件選定, {len(candidates_map)}件の候補リスト")
+    return matches, candidates_map
+
+
+def run_step3_generate(
+    survey: "SurveyData",
     lineup_dir: Path,
     template_dir: Path,
     template_name: str = "田村基本形",
     output_path: Optional[Path] = None,
+    user_led_selections: Optional[dict] = None,
 ) -> Path:
-    """Step 5〜8: LED選定 → Excel出力 → 検証 → フィードバック
+    """Step 3: LED選定 → Excel出力
 
-    SurveyData から直接パイプラインを実行する公開API。
-    写真パイプライン・テキストパーサー・外部モジュールから呼び出し可能。
+    ユーザーが確定した器具情報・写真紐付けからExcelを生成する。
+    user_led_selectionsが指定された場合、AIの自動選定を上書きする。
 
     Args:
-        survey: SurveyData オブジェクト
+        survey: 確定済みのSurveyData（Step 1で編集、Step 2で写真紐付け済み）
         lineup_dir: ラインナップ表ディレクトリ
         template_dir: テンプレートディレクトリ
         template_name: テンプレート名
-        output_path: 出力先パス（Noneなら自動生成）
+        output_path: 出力先パス
+        user_led_selections: ユーザーが手動選択したLED商品
+            {行ラベル: LEDProduct or None} 形式。指定された行はAI選定を上書き。
 
     Returns:
         生成されたExcelファイルパス
@@ -336,8 +319,8 @@ def run_from_survey_data(
     from excel_writer import ExcelWriter
     from models import QuotationJob, MatchResult
 
-    # --- Step 5: ラインナップ読み込み & LED選定 ---
-    logger.info("Step 5: LED選定")
+    # --- ラインナップ読み込み & LED選定 ---
+    logger.info("Step 3: LED選定")
     lineup_idx = LineupIndex()
     lineup_idx.load_all(lineup_dir)
 
@@ -347,6 +330,18 @@ def run_from_survey_data(
     feedback_rules = _load_feedback_rules()
     matcher = LEDMatcher(lineup_idx, feedback_rules=feedback_rules)
     matches = matcher.match_all(survey.fixtures)
+
+    # ユーザーの手動選択で上書き
+    if user_led_selections:
+        for match in matches:
+            label = match.fixture.row_label
+            if label in user_led_selections:
+                user_product = user_led_selections[label]
+                if user_product is not None:
+                    match.led_product = user_product
+                    match.match_notes = "ユーザー手動選択"
+                    match.confidence = 1.0
+                    match.needs_review = False
 
     # 除外器具のMatchResultも生成
     for excl in survey.excluded_fixtures:
@@ -361,8 +356,8 @@ def run_from_survey_data(
     led_products = [m.led_product for m in matches if m.led_product]
     img_idx.preload_images(led_products)
 
-    # --- Step 6: Excel出力 ---
-    logger.info("Step 6: Excel出力")
+    # --- Excel出力 ---
+    logger.info("Step 3: Excel出力")
     job = QuotationJob(
         survey=survey,
         matches=[m for m in matches if not m.fixture.is_excluded],
@@ -373,40 +368,53 @@ def run_from_survey_data(
     writer = ExcelWriter(template_dir, image_index=img_idx)
     result_path = writer.write_quotation(job)
 
-    # --- Step 7: Googleマップ検証 + AI異常検知 ---
-    logger.info("Step 7: Googleマップ検証 + AI異常検知")
-    from google_maps_checker import (
-        run_maps_check, format_check_report,
-        run_ai_anomaly_check, format_anomaly_report,
-    )
-    map_result = run_maps_check(survey)
-    if map_result.checklist:
-        report = format_check_report(map_result)
-        logger.info("\n" + report)
-
-    # AI異常検知
-    try:
-        anomaly_result = run_ai_anomaly_check(
-            survey, matches, map_result,
-        )
-        if anomaly_result.get("anomalies"):
-            logger.warning(
-                "\n" + format_anomaly_report(anomaly_result)
-            )
-        else:
-            logger.info("AI異常検知: 指摘事項なし")
-    except Exception as e:
-        logger.warning(f"AI異常検知エラー（スキップ）: {e}")
-
-    # --- Step 8: フィードバック自動比較 ---
-    _auto_feedback(result_path)
-
     logger.info(f"見積作成完了: {result_path}")
     return result_path
 
 
-# 後方互換エイリアス
-_run_from_step5 = run_from_survey_data
+def save_feedback_rule(
+    fixture_type: str,
+    wrong_selection: str,
+    correct_selection: str,
+) -> None:
+    """LED選定の修正をルールファイルに即時反映
+
+    同じfixture_typeとwrong_selectionの組み合わせが既にあればcountを増加、
+    なければ新規追加。
+    """
+    rules_path = Path(__file__).parent.parent / "feedback" / "led_selection_rules.json"
+    rules_path.parent.mkdir(parents=True, exist_ok=True)
+
+    rules = []
+    if rules_path.exists():
+        try:
+            rules = json.loads(rules_path.read_text(encoding="utf-8"))
+        except Exception:
+            rules = []
+
+    # 既存ルールを検索
+    found = False
+    for rule in rules:
+        if (rule.get("fixture_type") == fixture_type and
+                rule.get("wrong_selection") == wrong_selection):
+            rule["correct_selection"] = correct_selection
+            rule["count"] = rule.get("count", 0) + 1
+            found = True
+            break
+
+    if not found:
+        rules.append({
+            "fixture_type": fixture_type,
+            "wrong_selection": wrong_selection,
+            "correct_selection": correct_selection,
+            "count": 1,
+        })
+
+    rules_path.write_text(
+        json.dumps(rules, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    logger.info(f"フィードバックルール更新: {fixture_type} → {correct_selection}")
 
 
 def _load_feedback_rules() -> list[dict]:

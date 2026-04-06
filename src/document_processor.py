@@ -107,7 +107,10 @@ class DocumentProcessor:
         try:
             import sys
             from pathlib import Path
-            sys.path.insert(0, str(Path(__file__).parent.parent.parent))
+            # claude_guard.py は D:\Buzzarea\ にある
+            # __file__ = src/document_processor.py → 4階層上
+            buzzarea_dir = Path(__file__).resolve().parent.parent.parent.parent
+            sys.path.insert(0, str(buzzarea_dir))
             from claude_guard import get_guarded_client
             self._client = get_guarded_client(api_key=api_key)
             logger.info(f"Anthropic API 初期化完了 (model={self.model}) [claude_guard]")
@@ -318,16 +321,28 @@ class DocumentProcessor:
         merged = self.ocr_survey_sheet(
             image_paths[0], verify=verify, preprocess=preprocess,
         )
+        # ページ番号を付与（fixtures + excluded_fixtures 両方）
+        for fix in merged.get("fixtures", []):
+            fix["_page"] = 1
+        for fix in merged.get("excluded_fixtures", []):
+            fix["_page"] = 1
 
         # 2枚目以降があればマージ
-        for path in image_paths[1:]:
+        for page_idx, path in enumerate(image_paths[1:], start=2):
             try:
                 additional = self.ocr_survey_sheet(
                     path, verify=verify, preprocess=preprocess,
                 )
-                # 器具データを追加
+                # ページ番号を付与してから追加（fixtures + excluded_fixtures 両方）
+                for fix in additional.get("fixtures", []):
+                    fix["_page"] = page_idx
+                for fix in additional.get("excluded_fixtures", []):
+                    fix["_page"] = page_idx
                 merged.setdefault("fixtures", []).extend(
                     additional.get("fixtures", [])
+                )
+                merged.setdefault("excluded_fixtures", []).extend(
+                    additional.get("excluded_fixtures", [])
                 )
                 # 備考を追加
                 extra_notes = additional.get("special_notes", "")
@@ -566,94 +581,6 @@ class DocumentProcessor:
         ]
         return "\n".join(text_parts)
 
-    def classify_images(
-        self, image_paths: list[Path],
-    ) -> list[dict]:
-        """全画像をchecksheet/fixture/building/otherに自動分類
-
-        サムネイル(512px)を生成してClaude Visionに一括送信し、
-        各画像のカテゴリを判定する。
-
-        Args:
-            image_paths: 全画像パスのリスト
-
-        Returns:
-            [{"index": 0, "type": "checksheet", "confidence": "high", "reason": "..."}, ...]
-
-        Raises:
-            RuntimeError: APIが初期化されていない場合
-        """
-        if not self.is_ready:
-            raise RuntimeError("API未初期化")
-
-        if not image_paths:
-            return []
-
-        from image_preprocessor import create_thumbnail
-
-        logger.info(f"画像分類開始: {len(image_paths)}枚")
-
-        # サムネイル生成
-        thumbnails = []
-        for path in image_paths:
-            try:
-                b64_bytes, media_type = create_thumbnail(
-                    path, max_long_edge=512, jpeg_quality=70,
-                )
-                b64_data = base64.standard_b64encode(b64_bytes).decode("utf-8")
-                thumbnails.append((b64_data, media_type))
-            except Exception as e:
-                logger.warning(f"サムネイル生成失敗: {path.name}: {e}")
-                # 生画像をフォールバック
-                b64_data, media_type = _encode_image(path)
-                thumbnails.append((b64_data, media_type))
-
-        # 一括分類API呼出し
-        prompt = _load_prompt("photo_classification")
-        response = self._call_vision_api_multi(thumbnails, prompt)
-        result = self._extract_json_array(response)
-
-        # バリデーション
-        valid_types = {"checksheet", "fixture", "building", "other"}
-        validated = []
-        for item in result:
-            idx = item.get("index", -1)
-            img_type = item.get("type", "other")
-            if img_type not in valid_types:
-                img_type = "other"
-            if 0 <= idx < len(image_paths):
-                validated.append({
-                    "index": idx,
-                    "type": img_type,
-                    "confidence": item.get("confidence", "medium"),
-                    "reason": item.get("reason", ""),
-                })
-
-        # 全画像が結果に含まれているか確認
-        result_indices = {item["index"] for item in validated}
-        for i in range(len(image_paths)):
-            if i not in result_indices:
-                logger.warning(
-                    f"画像 {i} ({image_paths[i].name}) が分類結果に含まれていません。"
-                    "otherとして扱います。"
-                )
-                validated.append({
-                    "index": i,
-                    "type": "other",
-                    "confidence": "low",
-                    "reason": "分類結果に含まれなかった",
-                })
-
-        # ログ出力
-        for item in sorted(validated, key=lambda x: x["index"]):
-            name = image_paths[item["index"]].name
-            logger.info(
-                f"  画像分類: {name} → {item['type']} "
-                f"({item['confidence']})"
-            )
-
-        return validated
-
     def match_photos_to_rows(
         self,
         fixture_photos: list[Path],
@@ -700,137 +627,81 @@ class DocumentProcessor:
                 b64_data, media_type = _encode_image(path)
                 thumbnails.append((b64_data, media_type))
 
-        # 器具リストをテキスト化
+        # 器具リストをテキスト化（全バッチ共通）
         fixture_list_text = self._format_fixture_list(ocr_fixtures)
-
-        # プロンプトに器具リストを埋め込み
         prompt_template = _load_prompt("photo_row_matching")
-        prompt = prompt_template.replace("{fixture_list}", fixture_list_text)
-
-        # API呼出し
-        response = self._call_vision_api_multi(thumbnails, prompt)
-        result = self._extract_json_array(response)
-
-        # 結果をdict[str, list[Path]]に変換
         valid_labels = {f.get("row_label", "") for f in ocr_fixtures}
+
+        # バッチ分割（20枚ずつ）
+        BATCH_SIZE = 20
         photo_map: dict[str, list[Path]] = {}
 
-        for item in result:
-            photo_idx = item.get("photo_index", -1)
-            row_label = item.get("row_label", "")
-            confidence = item.get("confidence", "low")
+        num_batches = (len(thumbnails) + BATCH_SIZE - 1) // BATCH_SIZE
+        logger.info(f"写真マッチング: {len(thumbnails)}枚を{num_batches}バッチで処理")
 
-            if photo_idx < 0 or photo_idx >= len(fixture_photos):
-                continue
-            if row_label == "unmatched" or row_label not in valid_labels:
-                logger.info(
-                    f"  未マッチ: {fixture_photos[photo_idx].name} "
-                    f"(row={row_label}, conf={confidence})"
-                )
-                continue
+        for batch_idx in range(num_batches):
+            start = batch_idx * BATCH_SIZE
+            end = min(start + BATCH_SIZE, len(thumbnails))
+            batch_thumbs = thumbnails[start:end]
+            batch_photos = fixture_photos[start:end]
 
-            photo_map.setdefault(row_label, []).append(
-                fixture_photos[photo_idx]
-            )
             logger.info(
-                f"  マッチ: {fixture_photos[photo_idx].name} → "
-                f"行{row_label} ({confidence})"
+                f"  バッチ {batch_idx+1}/{num_batches}: "
+                f"写真{start}〜{end-1} ({len(batch_thumbs)}枚)"
             )
+
+            # ファイル名リスト（バッチ内のインデックスで生成）
+            filename_list = "\n".join(
+                f"  写真{i}: {batch_photos[i].name}"
+                for i in range(len(batch_photos))
+            )
+
+            # プロンプト構築
+            prompt = prompt_template.replace("{fixture_list}", fixture_list_text)
+            if "{filename_list}" in prompt:
+                prompt = prompt.replace("{filename_list}", filename_list)
+            else:
+                prompt += (
+                    f"\n\n【参考】各写真のファイル名:\n{filename_list}\n"
+                    "ファイル名に場所や器具の情報が含まれる場合は、マッチングの参考にしてください。"
+                )
+
+            # API呼出し（バッチ単位）
+            try:
+                response = self._call_vision_api_multi(batch_thumbs, prompt)
+                result = self._extract_json_array(response)
+            except Exception as e:
+                logger.warning(f"  バッチ{batch_idx+1}のAPI呼び出し失敗: {e}")
+                continue
+
+            # 結果を統合（photo_indexはバッチ内インデックス→全体インデックスに変換）
+            for item in result:
+                photo_idx_in_batch = item.get("photo_index", -1)
+                row_label = item.get("row_label", "")
+                confidence = item.get("confidence", "low")
+
+                if photo_idx_in_batch < 0 or photo_idx_in_batch >= len(batch_photos):
+                    continue
+                if row_label == "unmatched" or row_label not in valid_labels:
+                    logger.info(
+                        f"  未マッチ: {batch_photos[photo_idx_in_batch].name} "
+                        f"(row={row_label}, conf={confidence})"
+                    )
+                    continue
+
+                photo_map.setdefault(row_label, []).append(
+                    batch_photos[photo_idx_in_batch]
+                )
+                logger.info(
+                    f"  マッチ: {batch_photos[photo_idx_in_batch].name} → "
+                    f"行{row_label} ({confidence})"
+                )
 
         logger.info(
             f"写真マッチング完了: {sum(len(v) for v in photo_map.values())}枚 → "
             f"{len(photo_map)}行"
         )
         return photo_map
-
-    def analyze_fixtures_from_photos(
-        self,
-        all_images: list[Path],
-        property_name: str = "",
-    ) -> dict:
-        """チェックシートなしで写真から直接器具データを抽出
-
-        報告写真形式（ファイル名に【照明】を含む）の場合は場所情報を活用。
-        LINE写真形式の場合は全写真をAI任せで分類・解析。
-
-        Args:
-            all_images: 全画像パスのリスト
-            property_name: 物件名
-
-        Returns:
-            OCR結果と同等のdict（fixtures, excluded_fixtures等）
-        """
-        if not self.is_ready:
-            raise RuntimeError("API未初期化")
-
-        if not all_images:
-            return {"fixtures": [], "excluded_fixtures": []}
-
-        from image_preprocessor import create_thumbnail
-
-        logger.info(
-            f"写真直接解析開始: {len(all_images)}枚, "
-            f"物件名={property_name}"
-        )
-
-        # ファイル名一覧を作成
-        filename_list = "\n".join(
-            f"  [{i}] {img.name}" for i, img in enumerate(all_images)
-        )
-
-        # サムネイル生成（768pxで器具詳細を読み取れるように）
-        thumbnails = []
-        for path in all_images:
-            try:
-                b64_bytes, media_type = create_thumbnail(
-                    path, max_long_edge=768, jpeg_quality=75,
-                )
-                b64_data = base64.standard_b64encode(b64_bytes).decode("utf-8")
-                thumbnails.append((b64_data, media_type))
-            except Exception as e:
-                logger.warning(f"サムネイル生成失敗: {path.name}: {e}")
-                b64_data, media_type = _encode_image(path)
-                thumbnails.append((b64_data, media_type))
-
-        # プロンプトを構築
-        prompt_template = _load_prompt("photo_direct_analysis")
-        prompt = prompt_template.replace(
-            "{property_name}", property_name or "不明"
-        ).replace(
-            "{filename_list}", filename_list
-        )
-
-        # API呼出し
-        response = self._call_vision_api_multi(
-            thumbnails, prompt, model_override=DEFAULT_MODEL,
-        )
-        result = self._extract_json(response)
-
-        # バリデーション
-        fixtures = result.get("fixtures", [])
-        excluded = result.get("excluded_fixtures", [])
-        building_indices = result.get("building_photo_indices", [])
-
-        logger.info(
-            f"写真直接解析完了: 器具={len(fixtures)}種, "
-            f"除外={len(excluded)}種, "
-            f"建物写真={len(building_indices)}枚"
-        )
-
-        for f in fixtures:
-            label = f.get("row_label", "?")
-            location = f.get("location", "")
-            f_type = f.get("fixture_type", "")
-            qty = sum(
-                v for v in f.get("floor_quantities", {}).values()
-                if isinstance(v, (int, float))
-            )
-            conf = f.get("confidence", "?")
-            logger.info(
-                f"  {label}: {location} - {f_type} x{qty} ({conf})"
-            )
-
-        return result
 
     @staticmethod
     def _format_fixture_list(ocr_fixtures: list[dict]) -> str:

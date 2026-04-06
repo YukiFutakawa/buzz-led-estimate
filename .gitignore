@@ -17,6 +17,10 @@ output/
 正しい見積り/
 # feedback/ は Git 管理対象（GitHub Actions で自動コミット）
 
+# ラインナップキャッシュ
+.lineup_cache.pickle
+.lineup_cache.tmp
+
 # OS/IDE
 .DS_Store
 Thumbs.db

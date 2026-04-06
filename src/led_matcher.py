@@ -256,6 +256,51 @@ class LEDMatcher:
             needs_review=needs_size_review or classification.fallback,
         )
 
+    def get_top_candidates(
+        self, fixture: ExistingFixture, max_count: int = 5,
+    ) -> list:
+        """器具に対する代替LED候補を上位max_count件返す（プレビュー用）
+
+        match_fixture() と同じ分類・検索・サイズフィルタを使用し、
+        最終選定（1つ）ではなく上位候補リストを返す。
+        """
+        classification = self._classify_fixture(fixture)
+        candidates = self._search_candidates(classification, fixture)
+        if not candidates:
+            return []
+
+        # サイズフィルタ
+        existing_dims = self._parse_cached(fixture.fixture_size or "")
+        size_ok, _ = self._filter_by_size(
+            candidates, existing_dims, classification.is_recessed,
+        )
+        if not size_ok:
+            size_ok = candidates
+
+        # 親和度スコアリング + 価格ソート
+        all_scored = [
+            (p, self._successor_affinity(fixture, p, classification))
+            for p in size_ok
+        ]
+        if not all_scored:
+            return size_ok[:max_count]
+
+        max_affinity = max(s for _, s in all_scored)
+        threshold = max(max_affinity * 0.8, max_affinity - 2.0)
+        top_tier = [(p, s) for p, s in all_scored if s >= threshold]
+
+        # 価格あり優先
+        priced = [p for p, s in top_tier
+                  if p.purchase_price_total and p.purchase_price_total > 0]
+        pool = priced if priced else [p for p, s in top_tier]
+
+        _aff = {id(p): s for p, s in top_tier}
+        pool.sort(key=lambda p: (
+            p.purchase_price_total or 999999,
+            -_aff.get(id(p), 0.0),
+        ))
+        return pool[:max_count]
+
     # ===== 分類 =====
 
     def _classify_fixture(

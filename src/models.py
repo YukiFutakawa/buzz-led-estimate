@@ -212,7 +212,6 @@ class SurveyData:
     property_info: PropertyInfo = field(default_factory=PropertyInfo)
     fixtures: list[ExistingFixture] = field(default_factory=list)
     excluded_fixtures: list[ExistingFixture] = field(default_factory=list)
-    building_photo_path: Optional[Path] = None
     raw_ocr_text: str = ""
 
     @property
