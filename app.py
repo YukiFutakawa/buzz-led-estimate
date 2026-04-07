@@ -650,7 +650,7 @@ def _step2_photo_assignment():
 
     st.divider()
 
-    # --- 表形式 + 写真列 ---
+    # --- 表形式 + 写真列（1照明1写真の原則） ---
     photo_map = {}
 
     # ヘッダー行
@@ -664,11 +664,12 @@ def _step2_photo_assignment():
         page = fix.get("_page", 1)
         fq = fix.get("floor_quantities", {})
 
-        # 現在選択中の写真インデックス
+        # 現在選択中の写真インデックス（1枚のみ）
         state_key = f"photo_idx_{fix_idx}"
         if state_key not in st.session_state:
-            st.session_state[state_key] = list(default_selections.get(label, set()))
-        selected_indices = st.session_state[state_key]
+            defaults = default_selections.get(label, set())
+            st.session_state[state_key] = min(defaults) if defaults else None
+        selected_idx = st.session_state[state_key]
 
         # 行表示
         row_cols = st.columns([0.3, 0.3, 1, 1, 0.8, 0.4, 0.4, 0.4, 1.5])
@@ -681,37 +682,66 @@ def _step2_photo_assignment():
         row_cols[6].write(fq.get(2, fq.get("2", 0)))
         row_cols[7].write(fq.get(3, fq.get("3", 0)))
 
-        # 写真列: サムネイル表示
+        # 写真列: サムネイル表示（1枚）+ クリックで拡大
         with row_cols[8]:
-            if selected_indices:
-                img_cols = st.columns(min(len(selected_indices), 3))
-                for j, pi in enumerate(selected_indices):
-                    if pi < len(fixture_photos):
-                        with img_cols[j % len(img_cols)]:
-                            st.image(str(fixture_photos[pi]), width=60)
+            if selected_idx is not None and selected_idx < len(fixture_photos):
+                photo_path = str(fixture_photos[selected_idx])
+                st.image(photo_path, width=60)
+                # 拡大ボタン
+                if st.button("拡大", key=f"zoom_{fix_idx}", type="secondary"):
+                    st.session_state[f"_zoom_photo"] = photo_path
+                    st.session_state[f"_zoom_label"] = f"{label}: {fix.get('location', '')}"
             else:
                 st.caption("—")
 
-        # 写真変更用expander（行の下に）
+        # 写真変更用expander（1枚選択 = ラジオボタン）
         with st.expander(f"写真を変更 ({label})", expanded=False):
+            # ラジオボタン用の選択肢を作成
+            options = ["なし"] + [f"#{pi+1}" for pi in range(len(fixture_photos))]
+            current = 0 if selected_idx is None else selected_idx + 1
+            # サムネイル一覧を先に表示
             num_cols = min(len(fixture_photos), 6)
             cols = st.columns(num_cols)
             for pi, photo in enumerate(fixture_photos):
                 with cols[pi % num_cols]:
-                    is_selected = pi in selected_indices
-                    check = st.checkbox(
-                        f"#{pi+1}",
-                        value=is_selected,
-                        key=f"pcheck_{fix_idx}_{pi}",
+                    border = "2px solid #2E5090" if pi == selected_idx else "1px solid #ddd"
+                    st.markdown(
+                        f'<div style="border:{border};border-radius:4px;padding:2px;text-align:center">'
+                        f'<small>#{pi+1}</small></div>',
+                        unsafe_allow_html=True,
                     )
                     st.image(str(photo), width=60)
-                    if check and pi not in selected_indices:
-                        selected_indices.append(pi)
-                    elif not check and pi in selected_indices:
-                        selected_indices.remove(pi)
-            st.session_state[state_key] = selected_indices
+            # ラジオボタンで1枚選択
+            choice = st.radio(
+                "写真を選択",
+                options,
+                index=current,
+                key=f"pradio_{fix_idx}",
+                horizontal=True,
+                label_visibility="collapsed",
+            )
+            if choice == "なし":
+                st.session_state[state_key] = None
+            else:
+                st.session_state[state_key] = int(choice.replace("#", "")) - 1
 
-        photo_map[label] = [fixture_photos[i] for i in selected_indices if i < len(fixture_photos)]
+        selected_idx = st.session_state[state_key]
+        if selected_idx is not None and selected_idx < len(fixture_photos):
+            photo_map[label] = [fixture_photos[selected_idx]]
+        else:
+            photo_map[label] = []
+
+    # --- 写真拡大表示 ---
+    zoom_photo = st.session_state.get("_zoom_photo")
+    if zoom_photo:
+        zoom_label = st.session_state.get("_zoom_label", "")
+        st.divider()
+        st.subheader(f"拡大表示: {zoom_label}")
+        st.image(zoom_photo, use_container_width=True)
+        if st.button("閉じる", key="close_zoom"):
+            del st.session_state["_zoom_photo"]
+            st.session_state.pop("_zoom_label", None)
+            st.rerun()
 
     # --- 確定ボタン ---
     st.divider()
@@ -728,8 +758,10 @@ def _step2_photo_assignment():
         if st.button("戻る", use_container_width=True, key="back_step2"):
             st.session_state.photo_suggestions = []
             st.session_state.pop("_photo_ai_done", None)
+            st.session_state.pop("_zoom_photo", None)
+            st.session_state.pop("_zoom_label", None)
             for k in list(st.session_state.keys()):
-                if k.startswith("photo_idx_") or k.startswith("pcheck_"):
+                if k.startswith("photo_idx_") or k.startswith("pradio_"):
                     del st.session_state[k]
             st.session_state.current_step = 1
             st.rerun()
@@ -800,6 +832,73 @@ def _build_survey_from_session():
     )
 
     return survey
+
+
+def _led_search_ui(label: str, current_options: list):
+    """LED商品の検索UI（全ラインナップからフィルター検索）"""
+    # ラインナップインデックスをセッションから取得（run_step3_previewで既にロード済み）
+    lineup_idx_key = "_lineup_idx"
+    if lineup_idx_key not in st.session_state:
+        from lineup_loader import LineupIndex
+        idx = LineupIndex()
+        idx.load_all(LINEUP_DIR)
+        st.session_state[lineup_idx_key] = idx
+    lineup_idx = st.session_state[lineup_idx_key]
+
+    # フィルター入力
+    f_cols = st.columns([2, 1, 1, 1])
+    with f_cols[0]:
+        kw = st.text_input("商品名で検索", key=f"search_kw_{label}", placeholder="例: 逆富士")
+    with f_cols[1]:
+        manufacturers = sorted(set(p.manufacturer for p in lineup_idx.products if p.manufacturer))
+        mfr = st.selectbox("メーカー", ["すべて"] + manufacturers, key=f"search_mfr_{label}")
+    with f_cols[2]:
+        categories = lineup_idx.get_categories()
+        cat = st.selectbox("カテゴリ", ["すべて"] + categories, key=f"search_cat_{label}")
+    with f_cols[3]:
+        price_max = st.number_input("上限価格（円）", min_value=0, value=0, step=1000, key=f"search_price_{label}")
+
+    # 検索実行
+    results = lineup_idx.search(
+        keyword=kw if kw else None,
+        manufacturer=mfr if mfr != "すべて" else None,
+        sheet_name=cat if cat != "すべて" else None,
+    )
+    # 価格フィルター
+    if price_max > 0:
+        results = [r for r in results if r.purchase_price_total and r.purchase_price_total <= price_max]
+
+    # 結果表示
+    if not kw and mfr == "すべて" and cat == "すべて" and price_max == 0:
+        st.caption("条件を指定してください")
+        return
+
+    st.caption(f"検索結果: {len(results)}件" + ("（上位50件を表示）" if len(results) > 50 else ""))
+    display_results = results[:50]
+
+    if not display_results:
+        st.warning("該当する商品が見つかりません")
+        return
+
+    # 結果を表形式で表示
+    for i, p in enumerate(display_results):
+        r_cols = st.columns([0.3, 1.2, 0.8, 0.8, 0.8, 0.6])
+        with r_cols[0]:
+            if st.button("選択", key=f"pick_{label}_{i}", type="secondary"):
+                if "user_led_overrides" not in st.session_state:
+                    st.session_state.user_led_overrides = {}
+                st.session_state.user_led_overrides[label] = p
+                # selectboxのkeyを削除してrerun → 再描画時にdefault_idxが適用される
+                st.session_state.pop(f"led_select_{label}", None)
+                st.rerun()
+        r_cols[1].write(p.name)
+        r_cols[2].write(p.manufacturer or "—")
+        r_cols[3].write(f"¥{p.purchase_price_total:,}" if p.purchase_price_total else "—")
+        r_cols[4].write(p.fixture_size or "—")
+        if p.hp_link:
+            r_cols[5].markdown(f"[HP]({p.hp_link})")
+        else:
+            r_cols[5].write("—")
 
 
 def _step3_led_selection():
@@ -986,7 +1085,7 @@ def _step3_led_selection():
         matches = st.session_state.led_match_results
         candidates_map = st.session_state.get("led_candidates", {})
 
-        st.caption("AI選定結果を確認してください。変更したい行はプルダウンから別の商品を選べます。")
+        st.caption("AI選定結果を確認してください。変更したい行はプルダウンから別の商品を選べます。「検索して選ぶ」で全商品から探すこともできます。")
 
         # 行ラベル → MatchResult のマップ
         match_by_label = {}
@@ -1006,60 +1105,92 @@ def _step3_led_selection():
             # 候補リスト構築（AI選定 + 代替候補）
             candidates = candidates_map.get(label, [])
 
-            # AI選定商品の表示名
-            if led:
-                ai_display = (
-                    f"{led.name} ({led.purchase_price_total:,}円)"
-                    if led.purchase_price_total
-                    else led.name
-                )
-            else:
-                ai_display = "該当なし"
+            # 商品の表示名を生成するヘルパー
+            def _led_display(p):
+                if not p:
+                    return "該当なし"
+                parts = []
+                if p.manufacturer:
+                    parts.append(p.manufacturer)
+                parts.append(p.name)
+                if p.purchase_price_total:
+                    parts.append(f"¥{p.purchase_price_total:,}")
+                if p.fixture_size:
+                    parts.append(p.fixture_size)
+                return " | ".join(parts)
+
+            ai_display = _led_display(led)
 
             # selectbox用の選択肢を構築
             options_display = [f"AI選定: {ai_display}"]
             options_products = [led]  # index 0 = AI選定
 
+            # 検索で選ばれた商品があれば先頭に追加
+            override = st.session_state.get("user_led_overrides", {}).get(label)
+            default_idx = 0
+            if override:
+                override_display = f"手動選択: {_led_display(override)}"
+                options_display.insert(1, override_display)
+                options_products.insert(1, override)
+                default_idx = 1
+
             for c in candidates:
                 if led and c.name == led.name:
-                    continue  # AI選定と同じものはスキップ
-                c_display = (
-                    f"{c.name} ({c.purchase_price_total:,}円)"
-                    if c.purchase_price_total
-                    else c.name
-                )
-                options_display.append(c_display)
+                    continue
+                if override and c.name == override.name:
+                    continue
+                options_display.append(_led_display(c))
                 options_products.append(c)
 
             # UI: 各器具行
             with st.container():
-                col1, col2 = st.columns([1, 2])
-                with col1:
-                    review_mark = " *要確認" if m.needs_review else ""
-                    st.markdown(
-                        f"**{label}**: {fix['location']} — {fix['fixture_type']}"
-                        f"  \n信頼度: {confidence_pct}{review_mark}"
-                    )
-                with col2:
-                    selected_idx = st.selectbox(
-                        f"LED商品 ({label})",
-                        range(len(options_display)),
-                        format_func=lambda i, od=options_display: od[i],
-                        key=f"led_select_{label}",
-                        label_visibility="collapsed",
-                    )
-                    # ユーザーがAI選定以外を選んだ場合、overridesに記録
-                    if selected_idx > 0:
-                        if "user_led_overrides" not in st.session_state:
-                            st.session_state.user_led_overrides = {}
-                        st.session_state.user_led_overrides[label] = options_products[selected_idx]
+                review_mark = " *要確認" if m.needs_review else ""
+                st.markdown(
+                    f"**{label}: {fix['location']} — {fix['fixture_type']}**"
+                    f"　信頼度: {confidence_pct}{review_mark}"
+                )
+
+                select_key = f"led_select_{label}"
+                # overrideがある場合、selectboxのkeyが未設定ならdefault_idxをセット
+                if select_key not in st.session_state and default_idx > 0:
+                    st.session_state[select_key] = default_idx
+
+                selected_idx = st.selectbox(
+                    f"LED商品 ({label})",
+                    range(len(options_display)),
+                    format_func=lambda i, od=options_display: od[i],
+                    key=select_key,
+                    label_visibility="collapsed",
+                )
+
+                # ユーザーがAI選定以外を選んだ場合、overridesに記録
+                if selected_idx > 0:
+                    if "user_led_overrides" not in st.session_state:
+                        st.session_state.user_led_overrides = {}
+                    st.session_state.user_led_overrides[label] = options_products[selected_idx]
+                else:
+                    if "user_led_overrides" in st.session_state and label in st.session_state.user_led_overrides:
+                        del st.session_state.user_led_overrides[label]
+
+                # 選択中の商品の詳細表示
+                current_product = options_products[selected_idx] if selected_idx < len(options_products) else led
+                if current_product:
+                    detail_cols = st.columns([1, 1, 1, 1])
+                    detail_cols[0].caption(f"メーカー: {current_product.manufacturer or '—'}")
+                    detail_cols[1].caption(f"仕入: ¥{current_product.purchase_price_total:,}" if current_product.purchase_price_total else "仕入: —")
+                    detail_cols[2].caption(f"設置面: {current_product.fixture_size or '—'}")
+                    if current_product.hp_link:
+                        detail_cols[3].markdown(f"[商品ページ]({current_product.hp_link})", unsafe_allow_html=False)
                     else:
-                        # AI選定に戻した場合、overridesから削除
-                        if "user_led_overrides" in st.session_state and label in st.session_state.user_led_overrides:
-                            del st.session_state.user_led_overrides[label]
+                        detail_cols[3].caption("HP: —")
 
                 if m.match_notes:
                     st.caption(f"  {m.match_notes}")
+
+                # --- 検索して選ぶ機能 ---
+                with st.expander(f"検索して選ぶ ({label})", expanded=False):
+                    _led_search_ui(label, options_products)
+
                 st.divider()
 
         # ユーザー変更のサマリー

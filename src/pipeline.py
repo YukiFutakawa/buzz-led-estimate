@@ -171,9 +171,10 @@ def run_step1_ocr(
         result.ocr_result["raw_text"] = combined_text
         survey = parse_survey_ocr(result.ocr_result, fixture_photos={})
     elif text_input:
-        # テキストのみ: OCRスキップ
-        logger.info("Step 1: テキスト入力からパース（OCRスキップ）")
-        result.ocr_result = {"raw_text": text_input}
+        # テキストのみ: Claude APIでテキストを構造化
+        logger.info("Step 1: テキスト入力をAI解析")
+        processor = DocumentProcessor(api_key=api_key)
+        result.ocr_result = processor.parse_text_input(text_input)
         survey = parse_survey_ocr(result.ocr_result, fixture_photos={})
     else:
         # OCRのみ
@@ -281,7 +282,7 @@ def run_step3_preview(
     for fixture in fixtures:
         if fixture.is_excluded:
             continue
-        candidates = matcher.get_top_candidates(fixture, max_count=5)
+        candidates = matcher.get_top_candidates(fixture, max_count=15)
         candidates_map[fixture.row_label] = candidates
 
     logger.info(f"プレビュー完了: {len(matches)}件選定, {len(candidates_map)}件の候補リスト")

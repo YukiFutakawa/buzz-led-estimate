@@ -356,6 +356,84 @@ class DocumentProcessor:
 
         return merged
 
+    def parse_text_input(self, text: str) -> dict:
+        """テキスト入力を構造化されたOCR結果形式に変換
+
+        画像なしでテキストのみ入力された場合に使用。
+        Claude APIでテキストを解析し、fixtures形式のJSONを返す。
+
+        Args:
+            text: ユーザーが入力したテキスト（器具情報）
+
+        Returns:
+            OCR結果と同じ形式のdict（fixtures, excluded_fixtures等）
+        """
+        if not self.is_ready:
+            raise RuntimeError("API未初期化。APIキーを設定してください。")
+
+        prompt = (
+            "以下のテキストはLED照明の現地調査で記録された器具情報です。\n"
+            "このテキストを解析し、画像OCRと同じJSON形式で出力してください。\n\n"
+            "## テキスト入力\n"
+            f"```\n{text}\n```\n\n"
+            "## 出力ルール\n"
+            "- 行ラベルがない場合はA, B, C...と自動付与してください\n"
+            "- 階数の情報があれば floor_quantities に反映してください\n"
+            "  - 例: 「各階2台」で4階建て → {\"1F\": 2, \"2P\": 2, \"3P\": 2, \"4P\": 2}\n"
+            "  - 例: 「1階4台 2階4台」 → {\"1F\": 4, \"2P\": 4}\n"
+            "  - 例: 「1台」（階数不明）→ {\"1F\": 1}\n"
+            "- 電球種別にLEDが含まれる場合は is_excluded: true, exclusion_reason: \"LED済み\"\n"
+            "- 非常灯の場合も器具として登録してください\n"
+            "- confidence は常に \"high\" としてください\n\n"
+            "## 出力JSON形式\n\n"
+            "```json\n"
+            "{\n"
+            '  "header": {},\n'
+            '  "fixtures": [\n'
+            "    {\n"
+            '      "row_label": "A",\n'
+            '      "location": "設置場所",\n'
+            '      "fixture_type": "器具種別",\n'
+            '      "fixture_size": "",\n'
+            '      "bulb_type": "電球種別",\n'
+            '      "floor_quantities": {"1F": 0},\n'
+            '      "power_w": 0,\n'
+            '      "daily_hours": 0,\n'
+            '      "color_temp": "白",\n'
+            '      "is_excluded": false,\n'
+            '      "notes": "",\n'
+            '      "confidence": "high"\n'
+            "    }\n"
+            "  ],\n"
+            '  "excluded_fixtures": [],\n'
+            '  "special_notes": "",\n'
+            '  "raw_text": "元のテキスト"\n'
+            "}\n"
+            "```\n\n"
+            "コードブロック ```json ... ``` で囲んで出力してください。"
+        )
+
+        model = self.model
+        message = self._client.messages.create(
+            model=model,
+            max_tokens=self.max_tokens,
+            messages=[
+                {
+                    "role": "user",
+                    "content": prompt,
+                },
+            ],
+        )
+
+        text_parts = [
+            block.text for block in message.content
+            if hasattr(block, "text")
+        ]
+        response = "\n".join(text_parts)
+        result = self._extract_json(response)
+        result["raw_text"] = text
+        return result
+
     def analyze_fixture_photo(
         self, image_path: Path | str,
     ) -> dict:
