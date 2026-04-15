@@ -1,0 +1,29 @@
+services:
+  - type: web
+    name: buzz-led-estimate
+    runtime: python
+    buildCommand: |
+      pip install -r requirements.txt
+      git lfs install
+      git lfs pull
+    startCommand: streamlit run app.py --server.port $PORT --server.address 0.0.0.0 --server.headless true
+    envVars:
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: PYTHON_VERSION
+        value: 3.12.0
+      # Kintone連携（新方式）
+      - key: KINTONE_DOMAIN
+        value: wsd92wi2row6.cybozu.com
+      - key: KINTONE_APP63_ID
+        value: "63"
+      - key: KINTONE_APP63_TOKEN
+        sync: false
+      - key: KINTONE_FIXTURE_DETAIL_APP_ID
+        value: "68"
+      - key: KINTONE_FIXTURE_DETAIL_TOKEN
+        sync: false
+    disk:
+      name: lineup-data
+      mountPath: /opt/render/project/src/output
+      sizeGB: 1

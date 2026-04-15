@@ -85,9 +85,10 @@ def init_session():
     if "ai_excel_history" not in st.session_state:
         st.session_state.ai_excel_history = []  # [{name, bytes, timestamp, property_name}, ...]
 
-    # 3ステップUI用の状態
+    # ステップUI用の状態
+    # current_step: 0=モード選択, "new_select"=新方式プロジェクト選択, "new_photos"=写真選択, 1/2/3=既存フロー
     if "current_step" not in st.session_state:
-        st.session_state.current_step = 1  # 1=入力+器具編集, 2=写真紐付け, 3=LED選定+出力
+        st.session_state.current_step = 0
     if "step1_result" not in st.session_state:
         st.session_state.step1_result = None  # Step1Result
     if "confirmed_fixtures" not in st.session_state:
@@ -100,6 +101,15 @@ def init_session():
         st.session_state.photo_suggestions = []  # AI推定結果
     if "step_config" not in st.session_state:
         st.session_state.step_config = {}  # テンプレート名等の設定
+    # 新方式用
+    if "photo_by_kind" not in st.session_state:
+        st.session_state.photo_by_kind = {}
+    if "photo_selection" not in st.session_state:
+        st.session_state.photo_selection = {}
+    if "property_info" not in st.session_state:
+        st.session_state.property_info = {}
+    if "property_summary" not in st.session_state:
+        st.session_state.property_summary = {}
 
 
 def save_ai_excel_to_session(excel_bytes: bytes, filename: str, property_name: str):
@@ -229,13 +239,17 @@ def _reset_steps():
         shutil.rmtree(old_tmpdir, ignore_errors=True)
         st.session_state["_tmpdir_path"] = None
 
-    st.session_state.current_step = 1
+    st.session_state.current_step = 0
     st.session_state.step1_result = None
     st.session_state.confirmed_fixtures = []
     st.session_state.confirmed_excluded = []
     st.session_state.confirmed_photos = {}
     st.session_state.photo_suggestions = []
     st.session_state.step_config = {}
+    st.session_state.photo_by_kind = {}
+    st.session_state.photo_selection = {}
+    st.session_state.property_info = {}
+    st.session_state.property_summary = {}
     # LED選定・編集・AI紐付け関連
     for k in ["led_match_results", "led_candidates", "user_led_overrides",
               "fixtures_edit_done", "_photo_ai_done"]:
@@ -249,12 +263,32 @@ def _reset_steps():
 def _show_step_indicator():
     """現在のステップをプログレス表示"""
     step = st.session_state.current_step
+    if step == 0:
+        st.markdown("**:blue[作成方式を選択してください]**")
+        st.divider()
+        return
+    # 新方式フロー
+    if step in ("new_select", "new_photos"):
+        steps = [("new_select", "現調データ選択"), ("new_photos", "写真選択"), (3, "LED選定・出力")]
+        cols = st.columns(len(steps))
+        order = {s[0]: i for i, s in enumerate(steps)}
+        cur_idx = order.get(step, 0)
+        for i, (col, (key, label)) in enumerate(zip(cols, steps)):
+            if i == cur_idx:
+                col.markdown(f"**:blue[{label}]**")
+            elif i < cur_idx:
+                col.markdown(f"~~{label}~~")
+            else:
+                col.markdown(label)
+        st.divider()
+        return
+    # 旧方式
     steps = {1: "現調データ入力", 2: "写真の紐付け", 3: "LED選定・出力"}
     cols = st.columns(len(steps))
     for col, (num, label) in zip(cols, steps.items()):
         if num == step:
             col.markdown(f"**:blue[Step {num}. {label}]**")
-        elif num < step:
+        elif isinstance(step, int) and num < step:
             col.markdown(f"~~Step {num}. {label}~~")
         else:
             col.markdown(f"Step {num}. {label}")
@@ -262,21 +296,259 @@ def _show_step_indicator():
 
 
 def tab_estimate():
-    """見積作成タブ（3ステップUI）"""
+    """見積作成タブ（2モード × ステップUI）"""
     step = st.session_state.current_step
 
     _show_step_indicator()
-    if step > 1:
+    if step != 0:
         if st.button("最初からやり直す", type="secondary"):
             _reset_steps()
             st.rerun()
 
-    if step == 1:
+    if step == 0:
+        _step0_mode_selection()
+    elif step == "new_select":
+        _step_new_project_select()
+    elif step == "new_photos":
+        _step_new_photo_selection()
+    elif step == 1:
         _step1_input()
     elif step == 2:
         _step2_photo_assignment()
     elif step == 3:
         _step3_led_selection()
+
+
+# ============================================================
+# Step 0: モード選択（旧方式 / 新方式）
+# ============================================================
+
+def _step0_mode_selection():
+    """トップページ: 旧方式 or 新方式を選択"""
+    st.subheader("作成方式を選択")
+    st.caption(
+        "・旧方式：現調シート（画像/PDF/Excel）をアップロードして読み取り\n\n"
+        "・新方式：LED施工店マイページから送信されたキントーンの現調データを読み込む"
+    )
+    col1, col2 = st.columns(2)
+    with col1:
+        if st.button("旧方式にて作成開始", type="secondary", use_container_width=True):
+            st.session_state.current_step = 1
+            st.rerun()
+    with col2:
+        if st.button("新方式にて作成開始", type="primary", use_container_width=True):
+            st.session_state.current_step = "new_select"
+            st.rerun()
+
+
+# ============================================================
+# 新方式 Step A: 物件（キントーンApp63レコード）選択
+# ============================================================
+
+def _step_new_project_select():
+    """見積進捗=02.数量入力完了 のApp63レコードから選択してデータ読み込み"""
+    from kintone_survey_client import KintoneConfig, fetch_eligible_projects
+    from kintone_survey_loader import load_project_from_kintone
+
+    st.subheader("現調データを選択（キントーン連携）")
+
+    cfg = KintoneConfig()
+    err = cfg.validate()
+    if err:
+        st.error(f"キントーン接続設定エラー: {err}")
+        st.info("環境変数 KINTONE_APP63_TOKEN / KINTONE_FIXTURE_DETAIL_TOKEN を設定してください")
+        if st.button("モード選択に戻る"):
+            st.session_state.current_step = 0
+            st.rerun()
+        return
+
+    # 一覧取得
+    try:
+        with st.spinner("キントーンから対象案件を取得中..."):
+            projects = fetch_eligible_projects(cfg)
+    except Exception as e:
+        st.error(f"キントーンAPIエラー: {e}")
+        if st.button("モード選択に戻る"):
+            st.session_state.current_step = 0
+            st.rerun()
+        return
+
+    if not projects:
+        st.warning("対象案件がありません（見積進捗が「02.数量入力完了」のレコードがないか、マイページから未送信です）")
+        if st.button("モード選択に戻る"):
+            st.session_state.current_step = 0
+            st.rerun()
+        return
+
+    # ドロップダウン
+    def _fmt(p):
+        submitted = p.get("submitted_at", "") or ""
+        sub_short = submitted[:10] if submitted else "—"
+        return f"#{p['record_id']}  {p.get('property_name', '(物件名なし)')}  [{p.get('address', '')}]  送信:{sub_short}"
+
+    labels = [_fmt(p) for p in projects]
+    idx = st.selectbox(
+        f"対象案件（{len(projects)}件）",
+        range(len(projects)),
+        format_func=lambda i: labels[i],
+    )
+    selected = projects[idx]
+
+    st.markdown("**選択中の案件**")
+    st.write({
+        "レコードID": selected["record_id"],
+        "物件名": selected.get("property_name", ""),
+        "住所": selected.get("address", ""),
+        "送信日時": selected.get("submitted_at", ""),
+    })
+
+    c1, c2 = st.columns([3, 1])
+    with c1:
+        if st.button("この案件でデータ読み込み", type="primary", use_container_width=True):
+            try:
+                # 一時フォルダ確保
+                old_tmpdir = st.session_state.get("_tmpdir_path")
+                if old_tmpdir:
+                    import shutil
+                    shutil.rmtree(old_tmpdir, ignore_errors=True)
+                tmpdir = Path(tempfile.mkdtemp(prefix="led_estimate_new_"))
+                st.session_state["_tmpdir_path"] = str(tmpdir)
+
+                with st.status("キントーンからデータ取得中...", expanded=True) as status:
+                    loaded = load_project_from_kintone(cfg, selected, tmpdir)
+                    status.update(label="データ読み込み完了", state="complete")
+
+                st.session_state.confirmed_fixtures = loaded["confirmed_fixtures"]
+                st.session_state.confirmed_excluded = loaded["confirmed_excluded"]
+                st.session_state.confirmed_photos = loaded["confirmed_photos"]
+                st.session_state.photo_by_kind = loaded["photo_by_kind"]
+                st.session_state.photo_selection = loaded["photo_selection"]
+                st.session_state.property_summary = loaded["property_summary"]
+                st.session_state.property_info = loaded["property_info"]
+                st.session_state.step_config = loaded["step_config"]
+                st.session_state.step1_result = None
+                st.session_state.current_step = "new_photos"
+                st.rerun()
+            except Exception as e:
+                st.error(f"データ読み込みエラー: {e}")
+                import traceback
+                st.code(traceback.format_exc())
+    with c2:
+        if st.button("戻る", use_container_width=True):
+            st.session_state.current_step = 0
+            st.rerun()
+
+
+# ============================================================
+# 新方式 Step B: 写真のエクセル反映チェック選択
+# ============================================================
+
+def _step_new_photo_selection():
+    """各行の写真（fixture/bulb/inside/other）を横並びで表示し、Excel反映対象をチェック選択"""
+    from kintone_survey_loader import apply_photo_selection
+
+    st.subheader("写真の反映選択")
+    st.caption("エクセル見積書に反映させる写真をチェックしてください。初期値: 器具・電球=ON / 内部・その他=OFF")
+
+    # 物件サマリー
+    psum = st.session_state.property_summary or {}
+    if psum:
+        with st.expander("物件総合データ（参考）", expanded=False):
+            st.write({k: v for k, v in psum.items() if v not in ("", None)})
+
+    photo_by_kind = st.session_state.photo_by_kind or {}
+    selection = st.session_state.photo_selection or {}
+    fixtures = st.session_state.confirmed_fixtures or []
+
+    if not photo_by_kind:
+        st.warning("写真データがありません")
+        if st.button("戻る"):
+            st.session_state.current_step = "new_select"
+            st.rerun()
+        return
+
+    # 一括操作
+    bc1, bc2, bc3, bc4, _ = st.columns([1, 1, 1, 1, 2])
+    with bc1:
+        if st.button("内部すべてON"):
+            for lbl in selection:
+                selection[lbl]["inside"] = [True] * len(selection[lbl].get("inside", []))
+            st.session_state.photo_selection = selection
+            st.rerun()
+    with bc2:
+        if st.button("内部すべてOFF"):
+            for lbl in selection:
+                selection[lbl]["inside"] = [False] * len(selection[lbl].get("inside", []))
+            st.session_state.photo_selection = selection
+            st.rerun()
+    with bc3:
+        if st.button("その他すべてON"):
+            for lbl in selection:
+                selection[lbl]["other"] = [True] * len(selection[lbl].get("other", []))
+            st.session_state.photo_selection = selection
+            st.rerun()
+    with bc4:
+        if st.button("その他すべてOFF"):
+            for lbl in selection:
+                selection[lbl]["other"] = [False] * len(selection[lbl].get("other", []))
+            st.session_state.photo_selection = selection
+            st.rerun()
+
+    st.divider()
+
+    # 行ごとに横並び表示
+    fx_by_label = {f["row_label"]: f for f in fixtures}
+    KIND_LABEL = {"fixture": "器具", "bulb": "電球", "inside": "内部", "other": "その他"}
+
+    for label in photo_by_kind.keys():
+        fx = fx_by_label.get(label, {})
+        header = f"**{label}** — {fx.get('location', '')} / {fx.get('fixture_type', '')} / {fx.get('bulb_type', '')}"
+        st.markdown(header)
+
+        sel = selection.setdefault(label, {"fixture": [], "bulb": [], "inside": [], "other": []})
+        kinds = photo_by_kind[label]
+
+        # 4種類を横並び
+        kind_cols = st.columns(4)
+        for ki, kind in enumerate(("fixture", "bulb", "inside", "other")):
+            with kind_cols[ki]:
+                st.caption(KIND_LABEL[kind])
+                paths = kinds.get(kind, [])
+                flags = sel.get(kind, [])
+                # flag長をpaths長に合わせる
+                if len(flags) != len(paths):
+                    default = True if kind in ("fixture", "bulb") else False
+                    flags = [default] * len(paths)
+                    sel[kind] = flags
+                if not paths:
+                    st.caption("—")
+                for pi, p in enumerate(paths):
+                    try:
+                        st.image(p, width=90)
+                    except Exception:
+                        st.caption(Path(p).name)
+                    flags[pi] = st.checkbox(
+                        f"反映",
+                        value=flags[pi],
+                        key=f"psel_{label}_{kind}_{pi}",
+                    )
+                sel[kind] = flags
+        selection[label] = sel
+        st.divider()
+
+    st.session_state.photo_selection = selection
+
+    # 決定
+    c1, c2 = st.columns([3, 1])
+    with c1:
+        if st.button("選択を確定してLED選定へ", type="primary", use_container_width=True):
+            st.session_state.confirmed_photos = apply_photo_selection(st.session_state)
+            st.session_state.current_step = 3
+            st.rerun()
+    with c2:
+        if st.button("戻る", use_container_width=True):
+            st.session_state.current_step = "new_select"
+            st.rerun()
 
 
 # ============================================================
@@ -790,6 +1062,13 @@ def _build_survey_from_session():
         property_info.unlock_code = orig_info.unlock_code
         property_info.distribution_board = orig_info.distribution_board
         property_info.special_notes = orig_info.special_notes
+    else:
+        # 新方式: session_stateのproperty_infoから反映
+        pinfo = st.session_state.get("property_info") or {}
+        if pinfo:
+            property_info.unlock_code = pinfo.get("unlock_code", "") or ""
+            property_info.distribution_board = pinfo.get("distribution_board", "") or ""
+            property_info.special_notes = pinfo.get("special_notes", "") or ""
 
     survey_fixtures = []
     for fix in fixtures:
