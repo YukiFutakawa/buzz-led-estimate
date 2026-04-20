@@ -7,6 +7,9 @@ on:
   workflow_dispatch:
     # 手動実行も可能（GitHub Actions の UI から）
 
+permissions:
+  contents: write   # git push のため必要
+
 jobs:
   sync:
     runs-on: ubuntu-latest
